@@ -1,4 +1,4 @@
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
@@ -106,7 +106,10 @@ mod tests {
             Value::BulkString(b"ECHO".to_vec()),
             Value::BulkString(b"hey".to_vec()),
         ]);
-        assert_eq!(Value::parse(ECHO_HEY).unwrap(), Some((expected, ECHO_HEY.len())));
+        assert_eq!(
+            Value::parse(ECHO_HEY).unwrap(),
+            Some((expected, ECHO_HEY.len()))
+        );
     }
 
     #[test]
@@ -130,7 +133,10 @@ mod tests {
 
     #[test]
     fn encodes_values() {
-        assert_eq!(Value::BulkString(b"hey".to_vec()).encode(), b"$3\r\nhey\r\n");
+        assert_eq!(
+            Value::BulkString(b"hey".to_vec()).encode(),
+            b"$3\r\nhey\r\n"
+        );
         assert_eq!(Value::SimpleString("PONG".into()).encode(), b"+PONG\r\n");
         let array = Value::Array(vec![Value::Integer(1), Value::NullBulkString]);
         assert_eq!(array.encode(), b"*2\r\n:1\r\n$-1\r\n");

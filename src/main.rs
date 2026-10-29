@@ -5,12 +5,17 @@ mod resp;
 use anyhow::Result;
 use bytes::{Buf, BytesMut};
 use resp::Value;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+
+type Db = Arc<Mutex<HashMap<Vec<u8>, Vec<u8>>>>;
 
 #[tokio::main]
 async fn main() {
     let listener = TcpListener::bind("127.0.0.1:6379").await.unwrap();
+    let db = Db::default();
 
     loop {
         let stream = listener.accept().await;
@@ -19,8 +24,9 @@ async fn main() {
             Ok((stream, _)) => {
                 println!("accepted new connection");
 
+                let db = db.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle_connection(stream).await {
+                    if let Err(e) = handle_connection(stream, db).await {
                         println!("connection error: {}", e);
                     }
                 });
@@ -32,14 +38,16 @@ async fn main() {
     }
 }
 
-async fn handle_connection(mut stream: TcpStream) -> Result<()> {
+async fn handle_connection(mut stream: TcpStream, db: Db) -> Result<()> {
     let mut buf = BytesMut::with_capacity(512);
     loop {
         // A read can end partway through a command or hold several pipelined ones,
         // so answer every complete command buffered so far, then read more.
         while let Some((request, len)) = Value::parse(&buf)? {
             buf.advance(len);
-            stream.write_all(&handle_command(request).encode()).await?;
+            stream
+                .write_all(&handle_command(request, &db).encode())
+                .await?;
         }
 
         if stream.read_buf(&mut buf).await? == 0 {
@@ -48,7 +56,7 @@ async fn handle_connection(mut stream: TcpStream) -> Result<()> {
     }
 }
 
-fn handle_command(request: Value) -> Value {
+fn handle_command(request: Value, db: &Db) -> Value {
     let Some(args) = command_args(request) else {
         return Value::Error("ERR expected an array of bulk strings".into());
     };
@@ -60,10 +68,33 @@ fn handle_command(request: Value) -> Value {
         b"PING" => Value::SimpleString("PONG".into()),
         b"ECHO" => match args {
             [message] => Value::BulkString(message.clone()),
-            _ => Value::Error("ERR wrong number of arguments for 'echo' command".into()),
+            _ => wrong_arity("echo"),
         },
-        _ => Value::Error(format!("ERR unknown command '{}'", String::from_utf8_lossy(name))),
+        b"SET" => match args {
+            [key, value] => {
+                db.lock().unwrap().insert(key.clone(), value.clone());
+                Value::SimpleString("OK".into())
+            }
+            _ => wrong_arity("set"),
+        },
+        b"GET" => match args {
+            [key] => match db.lock().unwrap().get(key) {
+                Some(value) => Value::BulkString(value.clone()),
+                None => Value::NullBulkString,
+            },
+            _ => wrong_arity("get"),
+        },
+        _ => Value::Error(format!(
+            "ERR unknown command '{}'",
+            String::from_utf8_lossy(name)
+        )),
     }
+}
+
+fn wrong_arity(command: &str) -> Value {
+    Value::Error(format!(
+        "ERR wrong number of arguments for '{command}' command"
+    ))
 }
 
 /// Clients send each command as an array of bulk strings, e.g. ["ECHO", "hey"].
