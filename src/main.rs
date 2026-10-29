@@ -7,10 +7,22 @@ use bytes::{Buf, BytesMut};
 use resp::Value;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-type Db = Arc<Mutex<HashMap<Vec<u8>, Vec<u8>>>>;
+type Db = Arc<Mutex<HashMap<Vec<u8>, Entry>>>;
+
+struct Entry {
+    value: Vec<u8>,
+    expires_at: Option<Instant>,
+}
+
+impl Entry {
+    fn is_expired(&self) -> bool {
+        self.expires_at.is_some_and(|at| at <= Instant::now())
+    }
+}
 
 #[tokio::main]
 async fn main() {
@@ -71,17 +83,32 @@ fn handle_command(request: Value, db: &Db) -> Value {
             _ => wrong_arity("echo"),
         },
         b"SET" => match args {
-            [key, value] => {
-                db.lock().unwrap().insert(key.clone(), value.clone());
-                Value::SimpleString("OK".into())
-            }
+            [key, value, options @ ..] => match parse_expiry(options) {
+                Ok(expires_at) => {
+                    let entry = Entry {
+                        value: value.clone(),
+                        expires_at,
+                    };
+                    db.lock().unwrap().insert(key.clone(), entry);
+                    Value::SimpleString("OK".into())
+                }
+                Err(msg) => Value::Error(msg.into()),
+            },
             _ => wrong_arity("set"),
         },
         b"GET" => match args {
-            [key] => match db.lock().unwrap().get(key) {
-                Some(value) => Value::BulkString(value.clone()),
-                None => Value::NullBulkString,
-            },
+            [key] => {
+                let mut db = db.lock().unwrap();
+                match db.get(key) {
+                    // Expired keys are only removed once something tries to read them.
+                    Some(entry) if entry.is_expired() => {
+                        db.remove(key);
+                        Value::NullBulkString
+                    }
+                    Some(entry) => Value::BulkString(entry.value.clone()),
+                    None => Value::NullBulkString,
+                }
+            }
             _ => wrong_arity("get"),
         },
         _ => Value::Error(format!(
@@ -95,6 +122,32 @@ fn wrong_arity(command: &str) -> Value {
     Value::Error(format!(
         "ERR wrong number of arguments for '{command}' command"
     ))
+}
+
+/// Parses the options after `SET key value`. So far only an `EX seconds` or
+/// `PX milliseconds` expiry is supported.
+fn parse_expiry(options: &[Vec<u8>]) -> Result<Option<Instant>, &'static str> {
+    let (unit, amount) = match options {
+        [] => return Ok(None),
+        [unit, amount] => (unit.to_ascii_uppercase(), amount),
+        _ => return Err("ERR syntax error"),
+    };
+    let to_duration: fn(u64) -> Duration = match unit.as_slice() {
+        b"EX" => Duration::from_secs,
+        b"PX" => Duration::from_millis,
+        _ => return Err("ERR syntax error"),
+    };
+    let Some(amount) = std::str::from_utf8(amount)
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+    else {
+        return Err("ERR value is not an integer or out of range");
+    };
+    // checked_add so that an absurdly long expiry is an error rather than a panic.
+    match Instant::now().checked_add(to_duration(amount)) {
+        Some(expires_at) if amount > 0 => Ok(Some(expires_at)),
+        _ => Err("ERR invalid expire time in 'set' command"),
+    }
 }
 
 /// Clients send each command as an array of bulk strings, e.g. ["ECHO", "hey"].
