@@ -16,11 +16,11 @@ fn main() {
             Ok(mut stream) => {
                 let mut buf = [0; 512];
                 loop {
-                    let bytes_read = stream.read(&mut buf)?;
+                    let bytes_read = stream.read(&mut buf).unwrap();
                     if bytes_read == 0 {
                         break;
                     }
-                    stream.write_all(b"+PONG\r\n")?;
+                    stream.write_all(b"+PONG\r\n").unwrap();
                 }
             }
             Err(e) => {
