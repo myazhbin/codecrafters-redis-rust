@@ -1,138 +1,119 @@
-use anyhow::{bail, Result};
+use tokio::{net::TcpStream, io::{AsyncReadExt, AsyncWriteExt}};
+use bytes::BytesMut;
+use anyhow::Result;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, Debug)]
 pub enum Value {
     SimpleString(String),
-    Error(String),
-    Integer(i64),
-    BulkString(Vec<u8>),
-    NullBulkString,
+    BulkString(String),
     Array(Vec<Value>),
-    NullArray,
 }
 
 impl Value {
-    /// Parses one value from the start of `buf`. Returns `None` if `buf` doesn't hold a
-    /// complete value yet, otherwise the value and the number of bytes it took up.
-    pub fn parse(buf: &[u8]) -> Result<Option<(Value, usize)>> {
-        let Some((line, mut pos)) = read_line(buf) else {
-            return Ok(None);
-        };
-        let Some((&kind, line)) = line.split_first() else {
-            bail!("empty line");
-        };
-
-        let value = match kind {
-            b'+' => Value::SimpleString(String::from_utf8(line.to_vec())?),
-            b'-' => Value::Error(String::from_utf8(line.to_vec())?),
-            b':' => Value::Integer(parse_int(line)?),
-            b'$' => match parse_int(line)? {
-                -1 => Value::NullBulkString,
-                len => {
-                    let end = pos + usize::try_from(len)?;
-                    if buf.len() < end + 2 {
-                        return Ok(None);
-                    }
-                    if &buf[end..end + 2] != b"\r\n" {
-                        bail!("bulk string not terminated by CRLF");
-                    }
-                    let data = buf[pos..end].to_vec();
-                    pos = end + 2;
-                    Value::BulkString(data)
-                }
-            },
-            b'*' => match parse_int(line)? {
-                -1 => Value::NullArray,
-                len => {
-                    let mut items = Vec::new();
-                    for _ in 0..usize::try_from(len)? {
-                        let Some((item, used)) = Value::parse(&buf[pos..])? else {
-                            return Ok(None);
-                        };
-                        items.push(item);
-                        pos += used;
-                    }
-                    Value::Array(items)
-                }
-            },
-            _ => bail!("unknown RESP type byte {:?}", kind as char),
-        };
-        Ok(Some((value, pos)))
-    }
-
-    pub fn encode(&self) -> Vec<u8> {
+    pub fn serialize(self) -> String {
         match self {
-            Value::SimpleString(s) => format!("+{s}\r\n").into_bytes(),
-            Value::Error(msg) => format!("-{msg}\r\n").into_bytes(),
-            Value::Integer(n) => format!(":{n}\r\n").into_bytes(),
-            Value::BulkString(data) => {
-                let mut out = format!("${}\r\n", data.len()).into_bytes();
-                out.extend_from_slice(data);
-                out.extend_from_slice(b"\r\n");
-                out
-            }
-            Value::NullBulkString => b"$-1\r\n".to_vec(),
-            Value::Array(items) => {
-                let mut out = format!("*{}\r\n", items.len()).into_bytes();
-                for item in items {
-                    out.extend(item.encode());
-                }
-                out
-            }
-            Value::NullArray => b"*-1\r\n".to_vec(),
+            Value::SimpleString(s) => format!("+{}\r\n", s),
+            Value::BulkString(s) => format!("${}\r\n{}\r\n", s.chars().count(), s),
+            _ => panic!("Unsupported value for serialize"),
         }
     }
 }
 
-/// Returns the first line in `buf` (without its CRLF) and the offset just past the CRLF.
-fn read_line(buf: &[u8]) -> Option<(&[u8], usize)> {
-    let end = buf.windows(2).position(|w| w == b"\r\n")?;
-    Some((&buf[..end], end + 2))
+pub struct RespHandler {
+    stream: TcpStream,
+    buffer: BytesMut,
 }
 
-fn parse_int(line: &[u8]) -> Result<i64> {
-    Ok(std::str::from_utf8(line)?.parse()?)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    const ECHO_HEY: &[u8] = b"*2\r\n$4\r\nECHO\r\n$3\r\nhey\r\n";
-
-    #[test]
-    fn parses_command_array() {
-        let expected = Value::Array(vec![
-            Value::BulkString(b"ECHO".to_vec()),
-            Value::BulkString(b"hey".to_vec()),
-        ]);
-        assert_eq!(Value::parse(ECHO_HEY).unwrap(), Some((expected, ECHO_HEY.len())));
-    }
-
-    #[test]
-    fn waits_for_more_data_on_partial_input() {
-        for end in 0..ECHO_HEY.len() {
-            assert_eq!(Value::parse(&ECHO_HEY[..end]).unwrap(), None);
+impl RespHandler {
+    pub fn new(stream: TcpStream) -> Self {
+        RespHandler {
+            stream,
+            buffer: BytesMut::with_capacity(512),
         }
     }
 
-    #[test]
-    fn parses_only_the_first_of_several_values() {
-        let parsed = Value::parse(b"+OK\r\n:42\r\n").unwrap();
-        assert_eq!(parsed, Some((Value::SimpleString("OK".into()), 5)));
+    pub async fn read_value(&mut self) -> Result<Option<Value>> {
+        let bytes_read = self.stream.read_buf(&mut self.buffer).await?;
+
+        if bytes_read == 0 {
+            return Ok(None);
+        }
+
+        let (v, _) = parse_message(self.buffer.split())?;
+        Ok(Some(v))
     }
 
-    #[test]
-    fn rejects_malformed_input() {
-        assert!(Value::parse(b"?\r\n").is_err());
-        assert!(Value::parse(b"$3\r\nheyX\r\n").is_err());
+    pub async fn write_value(&mut self, value: Value) -> Result<()> {
+        self.stream.write(value.serialize().as_bytes()).await?;
+
+        Ok(())
+    }
+}
+
+fn parse_message(buffer: BytesMut) -> Result<(Value, usize)> {
+    match buffer[0] as char {
+        '+' => parse_simple_string(buffer),
+        '*' => parse_array(buffer),
+        '$' => parse_bulk_string(buffer),
+        _ => Err(anyhow::anyhow!("Not a known value type {:?}", buffer)),
+    }
+}
+
+fn parse_simple_string(buffer: BytesMut) -> Result<(Value, usize)> {
+    if let Some((line, len)) = read_until_crlf(&buffer[1..]) {
+        let string = String::from_utf8(line.to_vec()).unwrap();
+
+        return Ok((Value::SimpleString(string), len + 1))
     }
 
-    #[test]
-    fn encodes_values() {
-        assert_eq!(Value::BulkString(b"hey".to_vec()).encode(), b"$3\r\nhey\r\n");
-        assert_eq!(Value::SimpleString("PONG".into()).encode(), b"+PONG\r\n");
-        let array = Value::Array(vec![Value::Integer(1), Value::NullBulkString]);
-        assert_eq!(array.encode(), b"*2\r\n:1\r\n$-1\r\n");
+    return Err(anyhow::anyhow!("Invalid string {:?}", buffer));
+}
+
+fn parse_array(buffer: BytesMut) -> Result<(Value, usize)> {
+    let (array_length, mut bytes_consumed) = if let Some((line, len)) = read_until_crlf(&buffer[1..]) {
+        let array_length = parse_int(line)?;
+
+        (array_length, len + 1)
+    } else {
+        return Err(anyhow::anyhow!("Invalid array format {:?}", buffer));
+    };
+
+    let mut items = vec![];
+    for _ in 0..array_length {
+        let (array_item, len) = parse_message(BytesMut::from(&buffer[bytes_consumed..]))?;
+
+        items.push(array_item);
+        bytes_consumed += len;
     }
+
+    return Ok((Value::Array(items), bytes_consumed))
+}
+
+fn parse_bulk_string(buffer: BytesMut) -> Result<(Value, usize)> {
+    let (bulk_str_len, bytes_consumed) = if let Some((line, len)) = read_until_crlf(&buffer[1..]) {
+        let bulk_str_len = parse_int(line)?;
+
+        (bulk_str_len, len + 1)
+    } else {
+        return Err(anyhow::anyhow!("Invalid array format {:?}", buffer));
+    };
+
+    let end_of_bulk_str = bytes_consumed + bulk_str_len as usize;
+    let total_parsed = end_of_bulk_str + 2;
+
+    Ok((Value::BulkString(String::from_utf8(buffer[bytes_consumed..end_of_bulk_str].to_vec())?), total_parsed))
+}
+
+fn read_until_crlf(buffer: &[u8]) -> Option<(&[u8], usize)> {
+    for i in 1..buffer.len() {
+        if buffer[i - 1] == b'\r' && buffer[i] == b'\n' {
+            return Some((&buffer[0..(i - 1)], i + 1));
+        }
+    }
+
+    return None;
+}
+
+fn parse_int(buffer: &[u8]) -> Result<i64> {
+    Ok(String::from_utf8(buffer.to_vec())?.parse::<i64>()?)
 }
