@@ -34,7 +34,7 @@ check "$smaller" XADD p '3-*' a b
 check '$3\r\n7-0\r\n' XADD p 7 a b
 
 echo "== generated IDs"
-id=$(resp XADD auto '*' a b | nc -w 1 127.0.0.1 6379 | tr -d '\r' | sed -n 2p)
+id=$(resp XADD auto '*' a b | nc -w 1 127.0.0.1 "$port" | tr -d '\r' | sed -n 2p)
 now=$(($(date +%s) * 1000))
 near_now=no
 if [[ $id =~ ^[0-9]+-0$ ]] && ((${id%-*} > now - 5000 && ${id%-*} < now + 5000)); then

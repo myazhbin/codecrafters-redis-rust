@@ -109,9 +109,34 @@ impl std::fmt::Display for StreamId {
     }
 }
 
+/// Settings from the command line.
+struct Config {
+    /// The port to listen on, set with `--port`.
+    port: u16,
+}
+
+/// Reads the command-line arguments that follow the program's name: `[--port <port>]`.
+fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Config, String> {
+    let mut config = Config { port: 6379 };
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--port" => {
+                let port = args.next().ok_or("--port needs a port number")?;
+                config.port = port.parse().map_err(|_| format!("invalid port: {port}"))?;
+            }
+            _ => return Err(format!("unknown argument: {arg}")),
+        }
+    }
+    Ok(config)
+}
+
 #[tokio::main]
 async fn main() {
-    let listener = TcpListener::bind("127.0.0.1:6379").await.unwrap();
+    let config = parse_args(std::env::args().skip(1)).unwrap_or_else(|msg| {
+        eprintln!("{msg}");
+        std::process::exit(1);
+    });
+    let listener = TcpListener::bind(("127.0.0.1", config.port)).await.unwrap();
     let db = Db::default();
 
     loop {
@@ -913,4 +938,32 @@ fn command_args(request: Value) -> Option<Vec<Vec<u8>>> {
             _ => None,
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Result<Config, String> {
+        parse_args(args.iter().map(|arg| arg.to_string()))
+    }
+
+    #[test]
+    fn port_defaults_to_6379() {
+        assert_eq!(parse(&[]).unwrap().port, 6379);
+    }
+
+    #[test]
+    fn reads_the_port() {
+        assert_eq!(parse(&["--port", "6380"]).unwrap().port, 6380);
+    }
+
+    #[test]
+    fn rejects_bad_arguments() {
+        let error = |args: &[&str]| parse(args).err().unwrap();
+        assert_eq!(error(&["--port"]), "--port needs a port number");
+        assert_eq!(error(&["--port", "abc"]), "invalid port: abc");
+        assert_eq!(error(&["--port", "70000"]), "invalid port: 70000");
+        assert_eq!(error(&["--bogus"]), "unknown argument: --bogus");
+    }
 }
