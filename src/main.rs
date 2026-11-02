@@ -10,8 +10,17 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::oneshot;
 
-type Db = Arc<Mutex<HashMap<Vec<u8>, Entry>>>;
+type Db = Arc<Mutex<Store>>;
+
+#[derive(Default)]
+struct Store {
+    entries: HashMap<Vec<u8>, Entry>,
+    /// Clients blocked in BLPOP on each key, longest-waiting first. Each one is sent the
+    /// element it pops.
+    blocked: HashMap<Vec<u8>, VecDeque<oneshot::Sender<Vec<u8>>>>,
+}
 
 struct Entry {
     value: Data,
@@ -62,9 +71,23 @@ async fn handle_connection(mut stream: TcpStream, db: Db) -> Result<()> {
         // so answer every complete command buffered so far, then read more.
         while let Some((request, len)) = Value::parse(&buf)? {
             buf.advance(len);
-            stream
-                .write_all(&handle_command(request, &db).encode())
-                .await?;
+            let command = handle_command(request, &db);
+            tokio::pin!(command);
+            // BLPOP can wait indefinitely, so keep reading meanwhile. If the client hangs
+            // up, the wait is dropped rather than later taking an element nobody receives.
+            // `biased` checks the command first, so a ready reply is never skipped.
+            let reply = loop {
+                tokio::select! {
+                    biased;
+                    reply = &mut command => break reply,
+                    read = stream.read_buf(&mut buf) => {
+                        if read? == 0 {
+                            return Ok(());
+                        }
+                    }
+                }
+            };
+            stream.write_all(&reply.encode()).await?;
         }
 
         if stream.read_buf(&mut buf).await? == 0 {
@@ -73,7 +96,7 @@ async fn handle_connection(mut stream: TcpStream, db: Db) -> Result<()> {
     }
 }
 
-fn handle_command(request: Value, db: &Db) -> Value {
+async fn handle_command(request: Value, db: &Db) -> Value {
     let Some(args) = command_args(request) else {
         return Value::Error("ERR expected an array of bulk strings".into());
     };
@@ -94,7 +117,7 @@ fn handle_command(request: Value, db: &Db) -> Value {
                         value: Data::String(value.clone()),
                         expires_at,
                     };
-                    db.lock().unwrap().insert(key.clone(), entry);
+                    db.lock().unwrap().entries.insert(key.clone(), entry);
                     Value::SimpleString("OK".into())
                 }
                 Err(msg) => Value::Error(msg.into()),
@@ -123,7 +146,7 @@ fn handle_command(request: Value, db: &Db) -> Value {
         },
         b"LRANGE" => match args {
             [key, start, stop] => {
-                let (Some(start), Some(stop)) = (parse_integer(start), parse_integer(stop)) else {
+                let (Some(start), Some(stop)) = (parse_number(start), parse_number(stop)) else {
                     return Value::Error("ERR value is not an integer or out of range".into());
                 };
                 match live_value(&mut db.lock().unwrap(), key) {
@@ -144,11 +167,18 @@ fn handle_command(request: Value, db: &Db) -> Value {
         },
         b"LPOP" => match args {
             [key] => pop_from_list(db, key, None),
-            [key, count] => match parse_integer(count) {
+            [key, count] => match parse_number(count) {
                 Some(count) => pop_from_list(db, key, Some(count)),
                 None => Value::Error("ERR value is out of range, must be positive".into()),
             },
             _ => wrong_arity("lpop"),
+        },
+        b"BLPOP" => match args {
+            [key, timeout] => match parse_timeout(timeout) {
+                Ok(timeout) => blocking_pop(db, key, timeout).await,
+                Err(msg) => Value::Error(msg.into()),
+            },
+            _ => wrong_arity("blpop"),
         },
         _ => Value::Error(format!(
             "ERR unknown command '{}'",
@@ -180,7 +210,7 @@ fn parse_expiry(options: &[Vec<u8>]) -> Result<Option<Instant>, &'static str> {
         b"PX" => Duration::from_millis,
         _ => return Err("ERR syntax error"),
     };
-    let Some(amount) = parse_integer::<u64>(amount) else {
+    let Some(amount) = parse_number::<u64>(amount) else {
         return Err("ERR value is not an integer or out of range");
     };
     // checked_add so that an absurdly long expiry is an error rather than a panic.
@@ -190,18 +220,35 @@ fn parse_expiry(options: &[Vec<u8>]) -> Result<Option<Instant>, &'static str> {
     }
 }
 
-/// Parses an integer argument, such as an expiry time or a list index.
-fn parse_integer<T: std::str::FromStr>(arg: &[u8]) -> Option<T> {
+/// Parses a numeric argument, such as an expiry time, a list index or a timeout.
+fn parse_number<T: std::str::FromStr>(arg: &[u8]) -> Option<T> {
     std::str::from_utf8(arg).ok()?.parse().ok()
+}
+
+/// Parses BLPOP's timeout: a number of seconds, where 0 means wait forever.
+fn parse_timeout(arg: &[u8]) -> Result<Option<Duration>, &'static str> {
+    let Some(secs) = parse_number::<f64>(arg) else {
+        return Err("ERR timeout is not a float or out of range");
+    };
+    if secs < 0.0 {
+        return Err("ERR timeout is negative");
+    }
+    if secs == 0.0 {
+        return Ok(None);
+    }
+    match Duration::try_from_secs_f64(secs) {
+        Ok(timeout) => Ok(Some(timeout)),
+        Err(_) => Err("ERR timeout is out of range"),
+    }
 }
 
 /// Looks up the value at `key`. Expired keys are only removed once something tries to
 /// read them, so an expired key is removed here and treated as missing.
-fn live_value<'a>(db: &'a mut HashMap<Vec<u8>, Entry>, key: &[u8]) -> Option<&'a mut Data> {
-    if db.get(key).is_some_and(Entry::is_expired) {
-        db.remove(key);
+fn live_value<'a>(db: &'a mut Store, key: &[u8]) -> Option<&'a mut Data> {
+    if db.entries.get(key).is_some_and(Entry::is_expired) {
+        db.entries.remove(key);
     }
-    db.get_mut(key).map(|entry| &mut entry.value)
+    db.entries.get_mut(key).map(|entry| &mut entry.value)
 }
 
 /// Pushes `elements` onto the list at `key` one at a time (so LPUSH a b c gives c b a),
@@ -214,22 +261,23 @@ fn push_to_list(
 ) -> Value {
     let mut db = db.lock().unwrap();
     // An expired key counts as missing, so pushing to it starts a new list.
-    if db.get(key).is_some_and(Entry::is_expired) {
-        db.remove(key);
+    if db.entries.get(key).is_some_and(Entry::is_expired) {
+        db.entries.remove(key);
     }
-    let entry = db.entry(key.to_vec()).or_insert_with(|| Entry {
+    let entry = db.entries.entry(key.to_vec()).or_insert_with(|| Entry {
         value: Data::List(VecDeque::new()),
         expires_at: None,
     });
-    match &mut entry.value {
-        Data::List(list) => {
-            for element in elements {
-                push(list, element.clone());
-            }
-            Value::Integer(list.len() as i64)
-        }
-        Data::String(_) => wrong_type(),
+    let Data::List(list) = &mut entry.value else {
+        return wrong_type();
+    };
+    for element in elements {
+        push(list, element.clone());
     }
+    // Like Redis, reply with the length from before blocked clients take their elements.
+    let len = list.len();
+    serve_blocked(&mut db, key);
+    Value::Integer(len as i64)
 }
 
 /// Removes elements from the front of the list at `key`: just the first one as a bulk
@@ -253,9 +301,76 @@ fn pop_from_list(db: &Db, key: &[u8], count: Option<usize>) -> Value {
     };
     // Redis deletes a list along with its last element, so the key reads as missing again.
     if list.is_empty() {
-        db.remove(key);
+        db.entries.remove(key);
     }
     reply
+}
+
+/// Hands elements from the front of the list at `key` to the clients blocked on it,
+/// longest-waiting first.
+fn serve_blocked(db: &mut Store, key: &[u8]) {
+    let Some(waiters) = db.blocked.get_mut(key) else {
+        return;
+    };
+    // Forget clients that have stopped waiting: they timed out or hung up.
+    waiters.retain(|waiter| !waiter.is_closed());
+    if let Some(Data::List(list)) = db.entries.get_mut(key).map(|entry| &mut entry.value) {
+        while !list.is_empty() {
+            let Some(waiter) = waiters.pop_front() else {
+                break;
+            };
+            let element = list.pop_front().unwrap();
+            // A client can still stop waiting after the retain above, in which case its
+            // element goes back to the list for the next one.
+            if let Err(element) = waiter.send(element) {
+                list.push_front(element);
+            }
+        }
+        if list.is_empty() {
+            db.entries.remove(key);
+        }
+    }
+    if waiters.is_empty() {
+        db.blocked.remove(key);
+    }
+}
+
+/// Pops the first element of the list at `key`, waiting for one to be pushed if the
+/// list is empty: for up to `timeout`, or forever if there is none.
+async fn blocking_pop(db: &Db, key: &[u8], timeout: Option<Duration>) -> Value {
+    let mut receiver = {
+        let mut db = db.lock().unwrap();
+        if let Some(Data::String(_)) = live_value(&mut db, key) {
+            return wrong_type();
+        }
+        let (sender, receiver) = oneshot::channel();
+        db.blocked
+            .entry(key.to_vec())
+            .or_default()
+            .push_back(sender);
+        // Clients only wait while the list is empty, so if it has elements, this hands
+        // the first one straight to us.
+        serve_blocked(&mut db, key);
+        receiver
+    };
+    let element = match timeout {
+        None => receiver.await.ok(),
+        Some(timeout) => match tokio::time::timeout(timeout, &mut receiver).await {
+            Ok(received) => received.ok(),
+            // An element may have been handed over just as time ran out.
+            Err(_) => {
+                receiver.close();
+                receiver.try_recv().ok()
+            }
+        },
+    };
+    match element {
+        Some(element) => Value::Array(vec![
+            Value::BulkString(key.to_vec()),
+            Value::BulkString(element),
+        ]),
+        None => Value::NullArray,
+    }
 }
 
 /// Returns the elements from `start` to `stop` inclusive. Negative indexes count back
