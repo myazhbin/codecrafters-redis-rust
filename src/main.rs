@@ -180,6 +180,17 @@ async fn handle_command(request: Value, db: &Db) -> Value {
             },
             _ => wrong_arity("blpop"),
         },
+        b"TYPE" => match args {
+            [key] => {
+                let kind = match live_value(&mut db.lock().unwrap(), key) {
+                    Some(Data::String(_)) => "string",
+                    Some(Data::List(_)) => "list",
+                    None => "none",
+                };
+                Value::SimpleString(kind.into())
+            }
+            _ => wrong_arity("type"),
+        },
         _ => Value::Error(format!(
             "ERR unknown command '{}'",
             String::from_utf8_lossy(name)
