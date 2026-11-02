@@ -42,16 +42,34 @@ enum Data {
 struct StreamEntry {
     id: StreamId,
     /// The entry's field-value pairs, flattened: field1, value1, field2, value2, ...
-    #[expect(dead_code, reason = "XRANGE and XREAD, still to come, will read these")]
     fields: Vec<Vec<u8>>,
+}
+
+impl StreamEntry {
+    /// The entry as XRANGE and XREAD reply with it: its ID, then an array of its fields.
+    fn to_value(&self) -> Value {
+        let fields = self.fields.iter().cloned().map(Value::BulkString);
+        Value::Array(vec![
+            Value::BulkString(self.id.to_string().into_bytes()),
+            Value::Array(fields.collect()),
+        ])
+    }
 }
 
 /// A stream entry ID, written `<ms>-<seq>`: a Unix time in milliseconds, then a sequence
 /// number that tells apart entries from the same millisecond. IDs sort in that order.
-#[derive(Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct StreamId {
     ms: u64,
     seq: u64,
+}
+
+impl StreamId {
+    const MIN: Self = Self { ms: 0, seq: 0 };
+    const MAX: Self = Self {
+        ms: u64::MAX,
+        seq: u64::MAX,
+    };
 }
 
 impl std::fmt::Display for StreamId {
@@ -220,6 +238,22 @@ async fn handle_command(request: Value, db: &Db) -> Value {
             }
             _ => wrong_arity("xadd"),
         },
+        b"XRANGE" => match args {
+            [key, start, end] => {
+                let (Some(start), Some(end)) = (
+                    parse_range_bound(start, 0),
+                    parse_range_bound(end, u64::MAX),
+                ) else {
+                    return invalid_stream_id();
+                };
+                match live_value(&mut db.lock().unwrap(), key) {
+                    Some(Data::Stream(stream)) => Value::Array(stream_range(stream, start, end)),
+                    Some(_) => wrong_type(),
+                    None => Value::Array(vec![]),
+                }
+            }
+            _ => wrong_arity("xrange"),
+        },
         _ => Value::Error(format!(
             "ERR unknown command '{}'",
             String::from_utf8_lossy(name)
@@ -235,6 +269,10 @@ fn wrong_arity(command: &str) -> Value {
 
 fn wrong_type() -> Value {
     Value::Error("WRONGTYPE Operation against a key holding the wrong kind of value".into())
+}
+
+fn invalid_stream_id() -> Value {
+    Value::Error("ERR Invalid stream ID specified as stream command argument".into())
 }
 
 /// Parses the options after `SET key value`. So far only an `EX seconds` or
@@ -435,7 +473,7 @@ fn list_range(list: &VecDeque<Vec<u8>>, start: i64, stop: i64) -> Vec<Value> {
 /// with the new entry's ID.
 fn add_to_stream(db: &Db, key: &[u8], id: &[u8], fields: &[Vec<u8>]) -> Value {
     let Some((ms, seq)) = parse_xadd_id(id) else {
-        return Value::Error("ERR Invalid stream ID specified as stream command argument".into());
+        return invalid_stream_id();
     };
     // Rejected before the stream is created, so that this can't leave an empty one behind.
     if (ms, seq) == (Some(0), Some(0)) {
@@ -446,7 +484,7 @@ fn add_to_stream(db: &Db, key: &[u8], id: &[u8], fields: &[Vec<u8>]) -> Value {
         return wrong_type();
     };
     // A new stream counts as ending at 0-0, below every ID it can be given.
-    let last = stream.last().map(|entry| entry.id).unwrap_or_default();
+    let last = stream.last().map_or(StreamId::MIN, |entry| entry.id);
     let ms = ms.unwrap_or_else(|| {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -480,13 +518,41 @@ fn parse_xadd_id(arg: &[u8]) -> Option<(Option<u64>, Option<u64>)> {
     if arg == b"*" {
         return Some((None, None));
     }
+    if let Some(ms) = arg.strip_suffix(b"-*") {
+        return Some((Some(parse_number(ms)?), None));
+    }
+    let id = parse_stream_id(arg, 0)?;
+    Some((Some(id.ms), Some(id.seq)))
+}
+
+/// Parses an XRANGE bound: an ID, or `-` or `+` for the lowest or highest ID possible.
+fn parse_range_bound(arg: &[u8], missing_seq: u64) -> Option<StreamId> {
+    match arg {
+        b"-" => Some(StreamId::MIN),
+        b"+" => Some(StreamId::MAX),
+        _ => parse_stream_id(arg, missing_seq),
+    }
+}
+
+/// Parses a stream ID: `<ms>-<seq>`, or just `<ms>` with `missing_seq` as the sequence number.
+fn parse_stream_id(arg: &[u8], missing_seq: u64) -> Option<StreamId> {
     let arg = std::str::from_utf8(arg).ok()?;
-    let (ms, seq) = arg.split_once('-').unwrap_or((arg, "0"));
-    let seq = match seq {
-        "*" => None,
-        seq => Some(seq.parse().ok()?),
+    let (ms, seq) = match arg.split_once('-') {
+        Some((ms, seq)) => (ms.parse().ok()?, seq.parse().ok()?),
+        None => (arg.parse().ok()?, missing_seq),
     };
-    Some((Some(ms.parse().ok()?), seq))
+    Some(StreamId { ms, seq })
+}
+
+/// Returns the entries with IDs from `start` to `end` inclusive.
+fn stream_range(stream: &[StreamEntry], start: StreamId, end: StreamId) -> Vec<Value> {
+    // Entries are kept in ID order, so a binary search finds where the range begins.
+    let first = stream.partition_point(|entry| entry.id < start);
+    stream[first..]
+        .iter()
+        .take_while(|entry| entry.id <= end)
+        .map(StreamEntry::to_value)
+        .collect()
 }
 
 /// Clients send each command as an array of bulk strings, e.g. ["ECHO", "hey"].
