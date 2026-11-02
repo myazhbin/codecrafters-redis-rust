@@ -263,6 +263,10 @@ async fn handle_command(request: Value, db: &Db) -> Value {
             },
             _ => wrong_arity("xread"),
         },
+        b"INCR" => match args {
+            [key] => increment(db, key),
+            _ => wrong_arity("incr"),
+        },
         _ => Value::Error(format!(
             "ERR unknown command '{}'",
             String::from_utf8_lossy(name)
@@ -676,6 +680,24 @@ fn entries_after(db: &mut Store, keys: &[Vec<u8>], afters: &[StreamId]) -> Vec<V
         }
     }
     streams
+}
+
+/// Adds 1 to the integer stored at `key`, where a missing key counts as 0, and replies
+/// with the result.
+fn increment(db: &Db, key: &[u8]) -> Value {
+    let mut db = db.lock().unwrap();
+    let Data::String(value) = live_value_or_insert(&mut db, key, Data::String(b"0".to_vec()))
+    else {
+        return wrong_type();
+    };
+    let Some(n) = parse_number::<i64>(value) else {
+        return Value::Error("ERR value is not an integer or out of range".into());
+    };
+    let Some(n) = n.checked_add(1) else {
+        return Value::Error("ERR increment or decrement would overflow".into());
+    };
+    *value = n.to_string().into_bytes();
+    Value::Integer(n)
 }
 
 /// Clients send each command as an array of bulk strings, e.g. ["ECHO", "hey"].
