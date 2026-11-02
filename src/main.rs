@@ -121,24 +121,15 @@ fn handle_command(request: Value, db: &Db) -> Value {
         },
         b"RPUSH" => match args {
             [key, elements @ ..] if !elements.is_empty() => {
-                let mut db = db.lock().unwrap();
-                // An expired key counts as missing, so pushing to it starts a new list.
-                if db.get(key).is_some_and(Entry::is_expired) {
-                    db.remove(key);
-                }
-                let entry = db.entry(key.clone()).or_insert_with(|| Entry {
-                    value: Data::List(VecDeque::new()),
-                    expires_at: None,
-                });
-                match &mut entry.value {
-                    Data::List(list) => {
-                        list.extend(elements.iter().cloned());
-                        Value::Integer(list.len() as i64)
-                    }
-                    Data::String(_) => wrong_type(),
-                }
+                push_to_list(db, key, elements, VecDeque::push_back)
             }
             _ => wrong_arity("rpush"),
+        },
+        b"LPUSH" => match args {
+            [key, elements @ ..] if !elements.is_empty() => {
+                push_to_list(db, key, elements, VecDeque::push_front)
+            }
+            _ => wrong_arity("lpush"),
         },
         b"LRANGE" => match args {
             [key, start, stop] => {
@@ -203,6 +194,34 @@ fn parse_expiry(options: &[Vec<u8>]) -> Result<Option<Instant>, &'static str> {
 /// Parses an integer argument, such as an expiry time or a list index.
 fn parse_integer<T: std::str::FromStr>(arg: &[u8]) -> Option<T> {
     std::str::from_utf8(arg).ok()?.parse().ok()
+}
+
+/// Pushes `elements` onto the list at `key` one at a time (so LPUSH a b c gives c b a),
+/// creating the list if needed. Replies with the list's new length.
+fn push_to_list(
+    db: &Db,
+    key: &[u8],
+    elements: &[Vec<u8>],
+    push: fn(&mut VecDeque<Vec<u8>>, Vec<u8>),
+) -> Value {
+    let mut db = db.lock().unwrap();
+    // An expired key counts as missing, so pushing to it starts a new list.
+    if db.get(key).is_some_and(Entry::is_expired) {
+        db.remove(key);
+    }
+    let entry = db.entry(key.to_vec()).or_insert_with(|| Entry {
+        value: Data::List(VecDeque::new()),
+        expires_at: None,
+    });
+    match &mut entry.value {
+        Data::List(list) => {
+            for element in elements {
+                push(list, element.clone());
+            }
+            Value::Integer(list.len() as i64)
+        }
+        Data::String(_) => wrong_type(),
+    }
 }
 
 /// Returns the elements from `start` to `stop` inclusive. Negative indexes count back
