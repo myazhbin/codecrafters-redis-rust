@@ -254,6 +254,25 @@ async fn handle_command(request: Value, db: &Db) -> Value {
             }
             _ => wrong_arity("xrange"),
         },
+        b"XREAD" => match args {
+            [option, streams @ ..]
+                if option.eq_ignore_ascii_case(b"STREAMS") && streams.len() >= 2 =>
+            {
+                // STREAMS is followed by all the keys, then an ID for each of them.
+                if !streams.len().is_multiple_of(2) {
+                    return Value::Error(
+                        "ERR Unbalanced 'xread' list of streams: for each stream key an ID or \
+                         '$' must be specified."
+                            .into(),
+                    );
+                }
+                let (keys, ids) = streams.split_at(streams.len() / 2);
+                read_streams(db, keys, ids)
+            }
+            // Options before STREAMS, like COUNT and BLOCK, aren't supported yet.
+            [_, _, _, ..] => Value::Error("ERR syntax error".into()),
+            _ => wrong_arity("xread"),
+        },
         _ => Value::Error(format!(
             "ERR unknown command '{}'",
             String::from_utf8_lossy(name)
@@ -553,6 +572,41 @@ fn stream_range(stream: &[StreamEntry], start: StreamId, end: StreamId) -> Vec<V
         .take_while(|entry| entry.id <= end)
         .map(StreamEntry::to_value)
         .collect()
+}
+
+/// Returns, for each stream, the entries with IDs after the one given for it, where `$`
+/// stands for the stream's last ID. Streams without such entries are left out, and if
+/// that leaves none, the reply is a null array.
+fn read_streams(db: &Db, keys: &[Vec<u8>], ids: &[Vec<u8>]) -> Value {
+    let mut db = db.lock().unwrap();
+    let mut streams = Vec::new();
+    for (key, id) in keys.iter().zip(ids) {
+        let stream = match live_value(&mut db, key) {
+            Some(Data::Stream(stream)) => stream.as_slice(),
+            Some(_) => return wrong_type(),
+            None => &[],
+        };
+        let after = match id.as_slice() {
+            b"$" => stream.last().map_or(StreamId::MIN, |entry| entry.id),
+            id => match parse_stream_id(id, 0) {
+                Some(id) => id,
+                None => return invalid_stream_id(),
+            },
+        };
+        let first = stream.partition_point(|entry| entry.id <= after);
+        if first < stream.len() {
+            let entries = stream[first..].iter().map(StreamEntry::to_value).collect();
+            streams.push(Value::Array(vec![
+                Value::BulkString(key.clone()),
+                Value::Array(entries),
+            ]));
+        }
+    }
+    if streams.is_empty() {
+        Value::NullArray
+    } else {
+        Value::Array(streams)
+    }
 }
 
 /// Clients send each command as an array of bulk strings, e.g. ["ECHO", "hey"].
