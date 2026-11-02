@@ -5,7 +5,7 @@ mod resp;
 use anyhow::Result;
 use bytes::{Buf, BytesMut};
 use resp::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -14,7 +14,7 @@ use tokio::net::{TcpListener, TcpStream};
 type Db = Arc<Mutex<HashMap<Vec<u8>, Entry>>>;
 
 struct Entry {
-    value: Vec<u8>,
+    value: Data,
     expires_at: Option<Instant>,
 }
 
@@ -22,6 +22,11 @@ impl Entry {
     fn is_expired(&self) -> bool {
         self.expires_at.is_some_and(|at| at <= Instant::now())
     }
+}
+
+enum Data {
+    String(Vec<u8>),
+    List(VecDeque<Vec<u8>>),
 }
 
 #[tokio::main]
@@ -86,7 +91,7 @@ fn handle_command(request: Value, db: &Db) -> Value {
             [key, value, options @ ..] => match parse_expiry(options) {
                 Ok(expires_at) => {
                     let entry = Entry {
-                        value: value.clone(),
+                        value: Data::String(value.clone()),
                         expires_at,
                     };
                     db.lock().unwrap().insert(key.clone(), entry);
@@ -105,11 +110,35 @@ fn handle_command(request: Value, db: &Db) -> Value {
                         db.remove(key);
                         Value::NullBulkString
                     }
-                    Some(entry) => Value::BulkString(entry.value.clone()),
+                    Some(entry) => match &entry.value {
+                        Data::String(value) => Value::BulkString(value.clone()),
+                        Data::List(_) => wrong_type(),
+                    },
                     None => Value::NullBulkString,
                 }
             }
             _ => wrong_arity("get"),
+        },
+        b"RPUSH" => match args {
+            [key, elements @ ..] if !elements.is_empty() => {
+                let mut db = db.lock().unwrap();
+                // An expired key counts as missing, so pushing to it starts a new list.
+                if db.get(key).is_some_and(Entry::is_expired) {
+                    db.remove(key);
+                }
+                let entry = db.entry(key.clone()).or_insert_with(|| Entry {
+                    value: Data::List(VecDeque::new()),
+                    expires_at: None,
+                });
+                match &mut entry.value {
+                    Data::List(list) => {
+                        list.extend(elements.iter().cloned());
+                        Value::Integer(list.len() as i64)
+                    }
+                    Data::String(_) => wrong_type(),
+                }
+            }
+            _ => wrong_arity("rpush"),
         },
         _ => Value::Error(format!(
             "ERR unknown command '{}'",
@@ -122,6 +151,10 @@ fn wrong_arity(command: &str) -> Value {
     Value::Error(format!(
         "ERR wrong number of arguments for '{command}' command"
     ))
+}
+
+fn wrong_type() -> Value {
+    Value::Error("WRONGTYPE Operation against a key holding the wrong kind of value".into())
 }
 
 /// Parses the options after `SET key value`. So far only an `EX seconds` or
