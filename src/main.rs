@@ -953,6 +953,10 @@ fn increment(db: &mut Store, key: &[u8]) -> Value {
     Value::Integer(n)
 }
 
+/// The replication ID, which identifies the history of a master's dataset. Redis generates
+/// a new one each time it starts, but a fixed one is all that's needed here.
+const REPLICATION_ID: &str = "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb";
+
 /// INFO's reply: the sections named, or the default ones if none are. Replication is the
 /// only section so far, and as in Redis, a section that doesn't exist is just left out.
 fn info(db: &Store, sections: &[Vec<u8>]) -> Value {
@@ -967,7 +971,13 @@ fn info(db: &Store, sections: &[Vec<u8>]) -> Value {
         return Value::BulkString(Vec::new());
     }
     let role = if db.is_replica { "slave" } else { "master" };
-    Value::BulkString(format!("role:{role}").into_bytes())
+    // The offset counts the bytes of commands streamed to replicas, and none are yet.
+    let text = format!(
+        "role:{role}\r\n\
+         master_replid:{REPLICATION_ID}\r\n\
+         master_repl_offset:0\r\n"
+    );
+    Value::BulkString(text.into_bytes())
 }
 
 /// Clients send each command as an array of bulk strings, e.g. ["ECHO", "hey"].

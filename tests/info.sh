@@ -2,11 +2,14 @@
 # INFO, from the "The INFO command" stages on.
 source "$(dirname "$0")/helpers.sh"
 
-master='$11\r\nrole:master\r\n'
-slave='$10\r\nrole:slave\r\n'
+# The replication section after the role, which is the same on a master and a replica.
+# Every line ends in \r\n, and then the bulk string has a \r\n of its own to end it.
+rest='master_replid:8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb\r\nmaster_repl_offset:0\r\n'
+master='$91\r\nrole:master\r\n'$rest'\r\n'
+slave='$90\r\nrole:slave\r\n'$rest'\r\n'
 nothing='$0\r\n\r\n'
 
-echo "== stage test: without --replicaof, the server is a master"
+echo "== stage test: without --replicaof, the server is a master, with an ID and offset"
 check "$master" INFO replication
 check "$master" info replication
 
