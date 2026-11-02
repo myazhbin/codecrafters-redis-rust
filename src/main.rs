@@ -102,21 +102,11 @@ fn handle_command(request: Value, db: &Db) -> Value {
             _ => wrong_arity("set"),
         },
         b"GET" => match args {
-            [key] => {
-                let mut db = db.lock().unwrap();
-                match db.get(key) {
-                    // Expired keys are only removed once something tries to read them.
-                    Some(entry) if entry.is_expired() => {
-                        db.remove(key);
-                        Value::NullBulkString
-                    }
-                    Some(entry) => match &entry.value {
-                        Data::String(value) => Value::BulkString(value.clone()),
-                        Data::List(_) => wrong_type(),
-                    },
-                    None => Value::NullBulkString,
-                }
-            }
+            [key] => match live_value(&mut db.lock().unwrap(), key) {
+                Some(Data::String(value)) => Value::BulkString(value.clone()),
+                Some(Data::List(_)) => wrong_type(),
+                None => Value::NullBulkString,
+            },
             _ => wrong_arity("get"),
         },
         b"RPUSH" => match args {
@@ -136,20 +126,21 @@ fn handle_command(request: Value, db: &Db) -> Value {
                 let (Some(start), Some(stop)) = (parse_integer(start), parse_integer(stop)) else {
                     return Value::Error("ERR value is not an integer or out of range".into());
                 };
-                let mut db = db.lock().unwrap();
-                match db.get(key) {
-                    Some(entry) if entry.is_expired() => {
-                        db.remove(key);
-                        Value::Array(vec![])
-                    }
-                    Some(entry) => match &entry.value {
-                        Data::List(list) => Value::Array(list_range(list, start, stop)),
-                        Data::String(_) => wrong_type(),
-                    },
+                match live_value(&mut db.lock().unwrap(), key) {
+                    Some(Data::List(list)) => Value::Array(list_range(list, start, stop)),
+                    Some(Data::String(_)) => wrong_type(),
                     None => Value::Array(vec![]),
                 }
             }
             _ => wrong_arity("lrange"),
+        },
+        b"LLEN" => match args {
+            [key] => match live_value(&mut db.lock().unwrap(), key) {
+                Some(Data::List(list)) => Value::Integer(list.len() as i64),
+                Some(Data::String(_)) => wrong_type(),
+                None => Value::Integer(0),
+            },
+            _ => wrong_arity("llen"),
         },
         _ => Value::Error(format!(
             "ERR unknown command '{}'",
@@ -194,6 +185,15 @@ fn parse_expiry(options: &[Vec<u8>]) -> Result<Option<Instant>, &'static str> {
 /// Parses an integer argument, such as an expiry time or a list index.
 fn parse_integer<T: std::str::FromStr>(arg: &[u8]) -> Option<T> {
     std::str::from_utf8(arg).ok()?.parse().ok()
+}
+
+/// Looks up the value at `key`. Expired keys are only removed once something tries to
+/// read them, so an expired key is removed here and treated as missing.
+fn live_value<'a>(db: &'a mut HashMap<Vec<u8>, Entry>, key: &[u8]) -> Option<&'a mut Data> {
+    if db.get(key).is_some_and(Entry::is_expired) {
+        db.remove(key);
+    }
+    db.get_mut(key).map(|entry| &mut entry.value)
 }
 
 /// Pushes `elements` onto the list at `key` one at a time (so LPUSH a b c gives c b a),
