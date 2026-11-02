@@ -12,6 +12,12 @@ pub enum Value {
 }
 
 impl Value {
+    /// A command as clients send it: an array of bulk strings.
+    pub fn command<T: AsRef<[u8]>>(args: &[T]) -> Value {
+        let args = args.iter().map(|arg| arg.as_ref().to_vec());
+        Value::Array(args.map(Value::BulkString).collect())
+    }
+
     /// Parses one value from the start of `buf`. Returns `None` if `buf` doesn't hold a
     /// complete value yet, otherwise the value and the number of bytes it took up.
     pub fn parse(buf: &[u8]) -> Result<Option<(Value, usize)>> {
@@ -84,6 +90,23 @@ impl Value {
     }
 }
 
+/// Parses a file from the start of `buf`, sent like a bulk string but with no CRLF at the
+/// end, as a master sends its RDB file. Returns `None` if `buf` doesn't hold all of it yet,
+/// otherwise the file's contents and the number of bytes it took up.
+pub fn parse_file(buf: &[u8]) -> Result<Option<(Vec<u8>, usize)>> {
+    let Some((line, pos)) = read_line(buf) else {
+        return Ok(None);
+    };
+    let Some(len) = line.strip_prefix(b"$") else {
+        bail!("expected a file, got {:?}", String::from_utf8_lossy(line));
+    };
+    let end = pos + usize::try_from(parse_int(len)?)?;
+    if buf.len() < end {
+        return Ok(None);
+    }
+    Ok(Some((buf[pos..end].to_vec(), end)))
+}
+
 /// Returns the first line in `buf` (without its CRLF) and the offset just past the CRLF.
 fn read_line(buf: &[u8]) -> Option<(&[u8], usize)> {
     let end = buf.windows(2).position(|w| w == b"\r\n")?;
@@ -140,5 +163,33 @@ mod tests {
         assert_eq!(Value::SimpleString("PONG".into()).encode(), b"+PONG\r\n");
         let array = Value::Array(vec![Value::Integer(1), Value::NullBulkString]);
         assert_eq!(array.encode(), b"*2\r\n:1\r\n$-1\r\n");
+    }
+
+    #[test]
+    fn builds_commands() {
+        assert_eq!(Value::command(&["ECHO", "hey"]).encode(), ECHO_HEY);
+        let args = [b"ECHO".to_vec(), b"hey".to_vec()];
+        assert_eq!(Value::command(&args).encode(), ECHO_HEY);
+    }
+
+    #[test]
+    fn parses_a_file_without_a_final_crlf() {
+        let parsed = parse_file(b"$3\r\nabc+OK\r\n").unwrap();
+        assert_eq!(parsed, Some((b"abc".to_vec(), 7)));
+    }
+
+    #[test]
+    fn waits_for_the_rest_of_a_file() {
+        let file = b"$3\r\nabc";
+        for end in 0..file.len() {
+            assert_eq!(parse_file(&file[..end]).unwrap(), None);
+        }
+    }
+
+    #[test]
+    fn rejects_what_isnt_a_file() {
+        assert!(parse_file(b"+OK\r\n").is_err());
+        assert!(parse_file(b"$abc\r\n").is_err());
+        assert!(parse_file(b"$-1\r\n").is_err());
     }
 }

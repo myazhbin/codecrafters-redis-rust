@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Notify, oneshot};
+use tokio::sync::{Notify, mpsc, oneshot};
 
 type Db = Arc<Mutex<Store>>;
 
@@ -30,6 +30,18 @@ struct Store {
     versions: HashMap<Vec<u8>, u64>,
     /// Whether the server was started as a replica, with `--replicaof`.
     is_replica: bool,
+    /// The replicas connected to this server, by an ID that tells them apart.
+    replicas: HashMap<u64, Replica>,
+    next_replica_id: u64,
+    /// Notified when a replica connects or acknowledges an offset, so that blocked WAITs
+    /// count again.
+    replicas_changed: Arc<Notify>,
+    /// How far through the replication stream this server is, in bytes: how much of it a
+    /// master has sent, or how much of it a replica has processed.
+    repl_offset: u64,
+    /// Where the replication stream ended after the last write, which is as far as a
+    /// replica has to get to have all the writes. (The stream also holds GETACKs.)
+    write_offset: u64,
 }
 
 impl Store {
@@ -53,6 +65,75 @@ impl Store {
         remove_if_expired(self, key);
         self.versions.get(key) != Some(&version)
     }
+
+    /// Starts sending the replication stream to a new replica, which counts as having all
+    /// of it up to now. Returns the replica's ID.
+    fn add_replica(&mut self, stream: mpsc::UnboundedSender<Vec<u8>>) -> u64 {
+        let id = self.next_replica_id;
+        self.next_replica_id += 1;
+        let acked_offset = self.repl_offset;
+        self.replicas.insert(
+            id,
+            Replica {
+                stream,
+                acked_offset,
+            },
+        );
+        self.replicas_changed.notify_waiters();
+        id
+    }
+
+    /// Records a replica's acknowledgement that it has got as far as `offset`.
+    fn record_ack(&mut self, id: u64, offset: u64) {
+        if let Some(replica) = self.replicas.get_mut(&id) {
+            replica.acked_offset = offset;
+            self.replicas_changed.notify_waiters();
+        }
+    }
+
+    /// How many connected replicas have acknowledged getting as far as `offset`.
+    fn replicas_at(&mut self, offset: u64) -> usize {
+        // Forget replicas that have hung up.
+        self.replicas
+            .retain(|_, replica| !replica.stream.is_closed());
+        self.replicas
+            .values()
+            .filter(|replica| replica.acked_offset >= offset)
+            .count()
+    }
+
+    /// Adds `command` to the replication stream. With no replicas there's no stream, as in
+    /// Redis, so the offset stays where it is.
+    fn send_to_replicas<T: AsRef<[u8]>>(&mut self, command: &[T]) {
+        if self.replicas.is_empty() {
+            return;
+        }
+        let encoded = Value::command(command).encode();
+        self.repl_offset += encoded.len() as u64;
+        // Forget replicas that have hung up.
+        self.replicas
+            .retain(|_, replica| replica.stream.send(encoded.clone()).is_ok());
+    }
+
+    /// Sends a write to the replicas, to keep them in step.
+    fn propagate<T: AsRef<[u8]>>(&mut self, command: &[T]) {
+        self.send_to_replicas(command);
+        self.write_offset = self.repl_offset;
+    }
+
+    /// Propagates the pop of an element from the list at `key`. Replicas get it as LPOP
+    /// however the client came to pop it, so that a BLPOP never leaves them waiting.
+    fn propagate_pop(&mut self, key: &[u8]) {
+        self.propagate(&[b"LPOP".as_slice(), key]);
+    }
+}
+
+/// A replica connected to this server.
+struct Replica {
+    /// Takes the replication stream to the task serving the replica's connection.
+    stream: mpsc::UnboundedSender<Vec<u8>>,
+    /// How far through the stream the replica has acknowledged getting.
+    acked_offset: u64,
 }
 
 struct Entry {
@@ -166,8 +247,9 @@ async fn main() {
     }));
 
     if let Some((host, master_port)) = config.replicaof {
+        let db = db.clone();
         tokio::spawn(async move {
-            if let Err(e) = connect_to_master(&host, master_port, config.port).await {
+            if let Err(e) = connect_to_master(&host, master_port, config.port, &db).await {
                 println!("master connection error: {}", e);
             }
         });
@@ -194,43 +276,91 @@ async fn main() {
     }
 }
 
-/// Connects a replica to its master and goes through the handshake, waiting for the
-/// reply to each command before sending the next. Nothing uses what the master sends
-/// after that yet, so the replica then just ignores it until the master hangs up.
-async fn connect_to_master(host: &str, port: u16, listening_port: u16) -> Result<()> {
+/// Connects a replica to its master and goes through the handshake, waiting for the reply
+/// to each command before sending the next, then follows the master until it hangs up.
+async fn connect_to_master(host: &str, port: u16, listening_port: u16, db: &Db) -> Result<()> {
     let mut master = TcpStream::connect((host, port)).await?;
     let mut buf = BytesMut::with_capacity(512);
     let listening_port = listening_port.to_string();
-    let handshake = [
+    let first_commands = [
         vec!["PING"],
         vec!["REPLCONF", "listening-port", &listening_port],
         vec!["REPLCONF", "capa", "psync2"],
-        // The replica doesn't know the master's ID yet, and has none of its data.
-        vec!["PSYNC", "?", "-1"],
     ];
-    for command in handshake {
-        let args = command
-            .iter()
-            .map(|arg| Value::BulkString(arg.as_bytes().to_vec()));
-        let request = Value::Array(args.collect()).encode();
-        master.write_all(&request).await?;
-        if let Value::Error(msg) = read_reply(&mut master, &mut buf).await? {
-            bail!("the reply to {} was: {msg}", command.join(" "));
-        }
+    for command in first_commands {
+        ask_master(&mut master, &mut buf, &command).await?;
     }
-    tokio::io::copy(&mut master, &mut tokio::io::sink()).await?;
-    Ok(())
+    // The replica doesn't know the master's ID yet, and has none of its data.
+    let reply = ask_master(&mut master, &mut buf, &["PSYNC", "?", "-1"]).await?;
+    let Some(offset) = parse_fullresync(&reply) else {
+        bail!("the reply to PSYNC was: {reply:?}");
+    };
+    // The master's data comes as an RDB file, but masters here only ever send empty ones,
+    // so there's nothing to load.
+    read_from_master(&mut master, &mut buf, resp::parse_file).await?;
+    db.lock().unwrap().repl_offset = offset;
+    follow_master(&mut master, &mut buf, db).await
 }
 
-/// Reads the master's next reply, however many reads it takes for all of it to arrive.
-async fn read_reply(master: &mut TcpStream, buf: &mut BytesMut) -> Result<Value> {
+/// Sends a command to the master and waits for its reply, which mustn't be an error.
+async fn ask_master(master: &mut TcpStream, buf: &mut BytesMut, command: &[&str]) -> Result<Value> {
+    master.write_all(&Value::command(command).encode()).await?;
+    let reply = read_from_master(master, buf, Value::parse).await?;
+    if let Value::Error(msg) = &reply {
+        bail!("the reply to {} was: {msg}", command.join(" "));
+    }
+    Ok(reply)
+}
+
+/// Reads what the master sends next during the handshake, however many reads it takes for
+/// all of it to arrive, given how to parse it.
+async fn read_from_master<T>(
+    master: &mut TcpStream,
+    buf: &mut BytesMut,
+    parse: fn(&[u8]) -> Result<Option<(T, usize)>>,
+) -> Result<T> {
     loop {
-        if let Some((reply, len)) = Value::parse(buf)? {
+        if let Some((parsed, len)) = parse(buf)? {
             buf.advance(len);
-            return Ok(reply);
+            return Ok(parsed);
         }
         if master.read_buf(buf).await? == 0 {
             bail!("the master hung up during the handshake");
+        }
+    }
+}
+
+/// The replication offset in a master's reply to PSYNC: `FULLRESYNC <id> <offset>`.
+fn parse_fullresync(reply: &Value) -> Option<u64> {
+    let Value::SimpleString(reply) = reply else {
+        return None;
+    };
+    match reply.split(' ').collect::<Vec<_>>()[..] {
+        ["FULLRESYNC", _, offset] => offset.parse().ok(),
+        _ => None,
+    }
+}
+
+/// Processes the replication stream from the master until it hangs up. Its commands run
+/// like a client's, but the master gets no replies, except when it asks for an ACK.
+async fn follow_master(master: &mut TcpStream, buf: &mut BytesMut, db: &Db) -> Result<()> {
+    let mut session = Session::default();
+    loop {
+        // A read can end partway through a command or hold several of them.
+        while let Some((request, len)) = Value::parse(buf)? {
+            buf.advance(len);
+            if replconf_argument(&request, b"GETACK").is_some() {
+                let offset = db.lock().unwrap().repl_offset.to_string();
+                let ack = Value::command(&["REPLCONF", "ACK", &offset]);
+                master.write_all(&ack.encode()).await?;
+            } else {
+                handle_request(request, db, &mut session).await;
+            }
+            // Added only now, because an ACK doesn't count the GETACK that asked for it.
+            db.lock().unwrap().repl_offset += len as u64;
+        }
+        if master.read_buf(buf).await? == 0 {
+            return Ok(());
         }
     }
 }
@@ -243,6 +373,9 @@ struct Session {
     /// The keys the client is WATCHing, each with its version at the time. EXEC calls the
     /// transaction off if any of them has changed since.
     watched: Vec<(Vec<u8>, u64)>,
+    /// Set by PSYNC, which makes the client a replica: its ID, and where its replication
+    /// stream arrives.
+    replica: Option<(u64, mpsc::UnboundedReceiver<Vec<u8>>)>,
 }
 
 async fn handle_connection(mut stream: TcpStream, db: Db) -> Result<()> {
@@ -253,23 +386,30 @@ async fn handle_connection(mut stream: TcpStream, db: Db) -> Result<()> {
         // so answer every complete command buffered so far, then read more.
         while let Some((request, len)) = Value::parse(&buf)? {
             buf.advance(len);
-            let command = handle_request(request, &db, &mut session);
-            tokio::pin!(command);
-            // BLPOP can wait indefinitely, so keep reading meanwhile. If the client hangs
-            // up, the wait is dropped rather than later taking an element nobody receives.
-            // `biased` checks the command first, so a ready reply is never skipped.
-            let reply = loop {
-                tokio::select! {
-                    biased;
-                    reply = &mut command => break reply,
-                    read = stream.read_buf(&mut buf) => {
-                        if read? == 0 {
-                            return Ok(());
+            let reply = {
+                let command = handle_request(request, &db, &mut session);
+                tokio::pin!(command);
+                // Some commands can wait indefinitely, so keep reading meanwhile. If the
+                // client hangs up, the wait is dropped rather than later taking an element
+                // nobody receives. `biased` checks the command first, so a ready reply is
+                // never skipped.
+                loop {
+                    tokio::select! {
+                        biased;
+                        reply = &mut command => break reply,
+                        read = stream.read_buf(&mut buf) => {
+                            if read? == 0 {
+                                return Ok(());
+                            }
                         }
                     }
                 }
             };
             stream.write_all(&reply.encode()).await?;
+            // PSYNC has made this a replication connection, for good.
+            if let Some((id, replication_stream)) = session.replica.take() {
+                return serve_replica(stream, &db, id, replication_stream).await;
+            }
         }
 
         if stream.read_buf(&mut buf).await? == 0 {
@@ -278,8 +418,50 @@ async fn handle_connection(mut stream: TcpStream, db: Db) -> Result<()> {
     }
 }
 
+/// An empty RDB file: a header, some metadata, an end-of-file marker and a checksum.
+const EMPTY_RDB: &[u8] = b"REDIS0011\
+    \xfa\x09redis-ver\x057.2.0\
+    \xfa\x0aredis-bits\xc0\x40\
+    \xfa\x05ctime\xc2\x6d\x08\xbc\x65\
+    \xfa\x08used-mem\xc2\xb0\xc4\x10\x00\
+    \xfa\x08aof-base\xc0\x00\
+    \xff\xf0\x6e\x3b\xfe\xc0\xff\x5a\xa2";
+
+/// Serves a connection that PSYNC has made a replication connection: sends the replica an
+/// empty RDB file in place of the data so far, then the replication stream as it comes,
+/// while listening for the replica's ACKs. Goes on until the replica hangs up.
+async fn serve_replica(
+    mut stream: TcpStream,
+    db: &Db,
+    id: u64,
+    mut replication_stream: mpsc::UnboundedReceiver<Vec<u8>>,
+) -> Result<()> {
+    // Like a bulk string, but with no \r\n after the contents.
+    let header = format!("${}\r\n", EMPTY_RDB.len());
+    stream.write_all(header.as_bytes()).await?;
+    stream.write_all(EMPTY_RDB).await?;
+    let mut buf = BytesMut::with_capacity(512);
+    loop {
+        tokio::select! {
+            Some(data) = replication_stream.recv() => stream.write_all(&data).await?,
+            read = stream.read_buf(&mut buf) => {
+                if read? == 0 {
+                    return Ok(());
+                }
+                while let Some((request, len)) = Value::parse(&buf)? {
+                    buf.advance(len);
+                    let offset = replconf_argument(&request, b"ACK").and_then(parse_number);
+                    if let Some(offset) = offset {
+                        db.lock().unwrap().record_ack(id, offset);
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Handles a client's request. Inside a MULTI transaction, commands other than EXEC,
-/// DISCARD, MULTI and WATCH are queued until EXEC runs them all.
+/// DISCARD, MULTI, WATCH and PSYNC are queued until EXEC runs them all.
 async fn handle_request(request: Value, db: &Db, session: &mut Session) -> Value {
     let Some(command) = command_args(request) else {
         return Value::Error("ERR expected an array of bulk strings".into());
@@ -337,10 +519,25 @@ async fn handle_request(request: Value, db: &Db, session: &mut Session) -> Value
             session.watched.clear();
             Value::SimpleString("OK".into())
         }
+        Some(b"PSYNC") if command.len() == 3 => {
+            if session.transaction.is_some() {
+                return Value::Error("ERR Command not allowed inside a transaction".into());
+            }
+            let mut db = db.lock().unwrap();
+            // Only masters have replicas, so `repl_offset` only ever means one thing.
+            if db.is_replica {
+                return Value::Error("ERR a replica can't have replicas of its own".into());
+            }
+            let (sender, receiver) = mpsc::unbounded_channel();
+            session.replica = Some((db.add_replica(sender), receiver));
+            // A full resync is all there is, whatever the replica asks for.
+            Value::SimpleString(format!("FULLRESYNC {REPLICATION_ID} {}", db.repl_offset))
+        }
         Some(b"MULTI") => wrong_arity("multi"),
         Some(b"EXEC") => wrong_arity("exec"),
         Some(b"DISCARD") => wrong_arity("discard"),
         Some(b"WATCH") => wrong_arity("watch"),
+        Some(b"PSYNC") => wrong_arity("psync"),
         _ => match &mut session.transaction {
             Some(queued) => {
                 queued.push(command);
@@ -351,9 +548,15 @@ async fn handle_request(request: Value, db: &Db, session: &mut Session) -> Value
     }
 }
 
-/// Runs a command outside a transaction. BLPOP and XREAD BLOCK can wait here for data to
-/// arrive, without holding the lock; everything else runs straight through `execute`.
+/// Runs a command outside a transaction. BLPOP, XREAD BLOCK and WAIT can wait here, without
+/// holding the lock; everything else runs straight through `execute`.
 async fn handle_command(command: &[Vec<u8>], db: &Db) -> Value {
+    if let [name, wanted, timeout] = command
+        && name.eq_ignore_ascii_case(b"WAIT")
+        && let Ok((wanted, timeout)) = parse_wait_args(wanted, timeout)
+    {
+        return wait_for_replicas(db, wanted, timeout).await;
+    }
     if let [name, key, timeout] = command
         && name.eq_ignore_ascii_case(b"BLPOP")
         && let Ok(timeout) = parse_timeout(timeout)
@@ -373,9 +576,36 @@ async fn handle_command(command: &[Vec<u8>], db: &Db) -> Value {
     reply
 }
 
-/// Runs a command against the locked database. EXEC runs a whole transaction through
-/// this without letting go of the lock in between.
+/// Runs a command against the locked database, and propagates it if it's a write. EXEC runs
+/// a whole transaction through this without letting go of the lock in between.
 fn execute(db: &mut Store, command: &[Vec<u8>]) -> Value {
+    let reply = run_command(db, command);
+    propagate_write(db, command, &reply);
+    reply
+}
+
+/// Propagates `command`, which has just got `reply`, if it was a write that changed
+/// something. BLPOP isn't here because `pop_now` deals with it.
+fn propagate_write(db: &mut Store, command: &[Vec<u8>], reply: &Value) {
+    let Some(name) = command.first() else {
+        return;
+    };
+    match (name.to_ascii_uppercase().as_slice(), reply) {
+        (_, Value::Error(_)) => {}
+        (b"SET" | b"RPUSH" | b"LPUSH" | b"INCR", _) => db.propagate(command),
+        (b"LPOP", Value::BulkString(_)) => db.propagate(command),
+        (b"LPOP", Value::Array(popped)) if !popped.is_empty() => db.propagate(command),
+        // With the ID spelled out, because a replica would generate a different one.
+        (b"XADD", Value::BulkString(id)) => {
+            let mut command = command.to_vec();
+            command[2] = id.clone();
+            db.propagate(&command);
+        }
+        _ => {}
+    }
+}
+
+fn run_command(db: &mut Store, command: &[Vec<u8>]) -> Value {
     let Some((name, args)) = command.split_first() else {
         return Value::Error("ERR empty command".into());
     };
@@ -513,6 +743,21 @@ fn execute(db: &mut Store, command: &[Vec<u8>]) -> Value {
             _ => wrong_arity("unwatch"),
         },
         b"INFO" => info(db, args),
+        // Nothing uses what a replica says about itself in the handshake. The REPLCONFs that
+        // do matter, ACK and GETACK, are dealt with on the replication connection.
+        b"REPLCONF" => Value::SimpleString("OK".into()),
+        b"WAIT" => match args {
+            // Only inside a transaction does a valid WAIT get here (`handle_command` runs it
+            // otherwise), and there it doesn't wait, as in Redis.
+            [wanted, timeout] => match parse_wait_args(wanted, timeout) {
+                Ok(_) => {
+                    let offset = db.write_offset;
+                    Value::Integer(db.replicas_at(offset) as i64)
+                }
+                Err(msg) => Value::Error(msg.into()),
+            },
+            _ => wrong_arity("wait"),
+        },
         _ => Value::Error(format!(
             "ERR unknown command '{}'",
             String::from_utf8_lossy(name)
@@ -577,6 +822,25 @@ fn parse_timeout(arg: &[u8]) -> Result<Option<Duration>, &'static str> {
         Ok(timeout) => Ok(Some(timeout)),
         Err(_) => Err("ERR timeout is out of range"),
     }
+}
+
+/// Parses a timeout in milliseconds, where 0 means wait forever.
+fn parse_timeout_ms(arg: &[u8]) -> Result<Option<Duration>, &'static str> {
+    let Some(ms) = parse_number::<i64>(arg) else {
+        return Err("ERR timeout is not an integer or out of range");
+    };
+    if ms < 0 {
+        return Err("ERR timeout is negative");
+    }
+    Ok((ms > 0).then(|| Duration::from_millis(ms as u64)))
+}
+
+/// Parses WAIT's arguments: how many replicas to wait for, and for how long.
+fn parse_wait_args(wanted: &[u8], timeout: &[u8]) -> Result<(i64, Option<Duration>), &'static str> {
+    let Some(wanted) = parse_number(wanted) else {
+        return Err("ERR value is not an integer or out of range");
+    };
+    Ok((wanted, parse_timeout_ms(timeout)?))
 }
 
 /// Removes `key` if it has expired. Expired keys are only removed once something tries
@@ -663,7 +927,7 @@ fn serve_blocked(db: &mut Store) {
         };
         // Forget clients that have stopped waiting: they timed out or hung up.
         waiters.retain(|waiter| !waiter.is_closed());
-        let mut served = false;
+        let mut served = 0;
         if let Some(Data::List(list)) = db.entries.get_mut(&key).map(|entry| &mut entry.value) {
             while !list.is_empty() {
                 let Some(waiter) = waiters.pop_front() else {
@@ -671,7 +935,7 @@ fn serve_blocked(db: &mut Store) {
                 };
                 let element = list.pop_front().unwrap();
                 match waiter.send(element) {
-                    Ok(()) => served = true,
+                    Ok(()) => served += 1,
                     // A client can still stop waiting after the retain above, in which
                     // case its element goes back to the list for the next one.
                     Err(element) => list.push_front(element),
@@ -684,8 +948,9 @@ fn serve_blocked(db: &mut Store) {
         if waiters.is_empty() {
             db.blocked.remove(&key);
         }
-        if served {
+        for _ in 0..served {
             db.touch(&key);
+            db.propagate_pop(&key);
         }
     }
 }
@@ -736,6 +1001,7 @@ fn pop_now(db: &mut Store, key: &[u8]) -> Value {
         db.entries.remove(key);
     }
     db.touch(key);
+    db.propagate_pop(key);
     blpop_reply(key, element)
 }
 
@@ -861,14 +1127,7 @@ struct XreadArgs<'a> {
 fn parse_xread_args(args: &[Vec<u8>]) -> Result<XreadArgs<'_>, &'static str> {
     let (block, args) = match args {
         [option, ms, rest @ ..] if option.eq_ignore_ascii_case(b"BLOCK") => {
-            let Some(ms) = parse_number::<i64>(ms) else {
-                return Err("ERR timeout is not an integer or out of range");
-            };
-            if ms < 0 {
-                return Err("ERR timeout is negative");
-            }
-            let timeout = (ms > 0).then(|| Duration::from_millis(ms as u64));
-            (Some(timeout), rest)
+            (Some(parse_timeout_ms(ms)?), rest)
         }
         _ => (None, args),
     };
@@ -1020,13 +1279,70 @@ fn info(db: &Store, sections: &[Vec<u8>]) -> Value {
         return Value::BulkString(Vec::new());
     }
     let role = if db.is_replica { "slave" } else { "master" };
-    // The offset counts the bytes of commands streamed to replicas, and none are yet.
+    let offset = db.repl_offset;
     let text = format!(
         "role:{role}\r\n\
          master_replid:{REPLICATION_ID}\r\n\
-         master_repl_offset:0\r\n"
+         master_repl_offset:{offset}\r\n"
     );
     Value::BulkString(text.into_bytes())
+}
+
+/// WAIT outside a transaction: replies with how many replicas have acknowledged all the
+/// writes so far, as soon as that's at least `wanted`, or else after `timeout` (or never,
+/// if there's no timeout).
+async fn wait_for_replicas(db: &Db, wanted: i64, timeout: Option<Duration>) -> Value {
+    let (offset, replicas_changed) = {
+        let mut db = db.lock().unwrap();
+        let offset = db.write_offset;
+        let caught_up = db.replicas_at(offset);
+        if caught_up as i64 >= wanted {
+            return Value::Integer(caught_up as i64);
+        }
+        // Replicas only acknowledge what they've got when asked, so ask if any are behind.
+        if caught_up < db.replicas.len() {
+            db.send_to_replicas(&["REPLCONF", "GETACK", "*"]);
+        }
+        (offset, db.replicas_changed.clone())
+    };
+    let wait = async {
+        loop {
+            // Listen for changes before counting, so that one in between isn't missed.
+            let changed = replicas_changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            let caught_up = db.lock().unwrap().replicas_at(offset);
+            if caught_up as i64 >= wanted {
+                return caught_up;
+            }
+            changed.await;
+        }
+    };
+    let caught_up = match timeout {
+        None => wait.await,
+        Some(timeout) => match tokio::time::timeout(timeout, wait).await {
+            Ok(caught_up) => caught_up,
+            Err(_) => db.lock().unwrap().replicas_at(offset),
+        },
+    };
+    Value::Integer(caught_up as i64)
+}
+
+/// The argument of a `REPLCONF <option> <argument>` command, if that's what `request` is.
+fn replconf_argument<'a>(request: &'a Value, option: &[u8]) -> Option<&'a [u8]> {
+    let Value::Array(args) = request else {
+        return None;
+    };
+    match args.as_slice() {
+        [
+            Value::BulkString(name),
+            Value::BulkString(given),
+            Value::BulkString(argument),
+        ] if name.eq_ignore_ascii_case(b"REPLCONF") && given.eq_ignore_ascii_case(option) => {
+            Some(argument)
+        }
+        _ => None,
+    }
 }
 
 /// Clients send each command as an array of bulk strings, e.g. ["ECHO", "hey"].

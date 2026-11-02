@@ -37,6 +37,11 @@ script_tests! {
     port: "port.sh",
     info: "info.sh",
     handshake: "handshake.py",
+    master_handshake: "master_handshake.py",
+    propagation: "propagation.py",
+    replica_commands: "replica_commands.py",
+    wait: "wait.py",
+    replication: "replication.py",
 }
 
 /// Runs tests/<script>, failing if it reports a failure, with the script's output shown.
