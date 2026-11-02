@@ -20,8 +20,37 @@ struct Store {
     /// Clients blocked in BLPOP on each key, longest-waiting first. Each one is sent the
     /// element it pops.
     blocked: HashMap<Vec<u8>, VecDeque<oneshot::Sender<Vec<u8>>>>,
+    /// Lists pushed to by the command or transaction being run. As in Redis, clients
+    /// blocked on them are served once it's done, so a transaction never sees that happen.
+    pushed: Vec<Vec<u8>>,
     /// Notified whenever an entry is added to a stream, so that blocked XREADs look again.
     stream_added: Arc<Notify>,
+    /// For WATCH: a counter for each key that has ever been watched, which goes up
+    /// whenever the key is written to, deleted or expires.
+    versions: HashMap<Vec<u8>, u64>,
+}
+
+impl Store {
+    /// Records a change to `key`, for anyone WATCHing it.
+    fn touch(&mut self, key: &[u8]) {
+        if let Some(version) = self.versions.get_mut(key) {
+            *version += 1;
+        }
+    }
+
+    /// Starts tracking changes to `key` for WATCH, and returns its current version.
+    fn watch(&mut self, key: &[u8]) -> u64 {
+        // A key that has already expired goes now, so that it doesn't count as a change.
+        remove_if_expired(self, key);
+        *self.versions.entry(key.to_vec()).or_insert(0)
+    }
+
+    /// Whether `key` has changed since WATCH saw it at `version`.
+    fn has_changed(&mut self, key: &[u8], version: u64) -> bool {
+        // Expiring counts as a change too, even if nothing has looked at the key since.
+        remove_if_expired(self, key);
+        self.versions.get(key) != Some(&version)
+    }
 }
 
 struct Entry {
@@ -106,16 +135,25 @@ async fn main() {
     }
 }
 
+/// What the server keeps track of for each client connection.
+#[derive(Default)]
+struct Session {
+    /// The commands queued for EXEC while the client is inside a MULTI transaction.
+    transaction: Option<Vec<Vec<Vec<u8>>>>,
+    /// The keys the client is WATCHing, each with its version at the time. EXEC calls the
+    /// transaction off if any of them has changed since.
+    watched: Vec<(Vec<u8>, u64)>,
+}
+
 async fn handle_connection(mut stream: TcpStream, db: Db) -> Result<()> {
     let mut buf = BytesMut::with_capacity(512);
-    // The commands queued for EXEC while the client is inside a MULTI transaction.
-    let mut transaction = None;
+    let mut session = Session::default();
     loop {
         // A read can end partway through a command or hold several pipelined ones,
         // so answer every complete command buffered so far, then read more.
         while let Some((request, len)) = Value::parse(&buf)? {
             buf.advance(len);
-            let command = handle_request(request, &db, &mut transaction);
+            let command = handle_request(request, &db, &mut session);
             tokio::pin!(command);
             // BLPOP can wait indefinitely, so keep reading meanwhile. If the client hangs
             // up, the wait is dropped rather than later taking an element nobody receives.
@@ -141,43 +179,69 @@ async fn handle_connection(mut stream: TcpStream, db: Db) -> Result<()> {
 }
 
 /// Handles a client's request. Inside a MULTI transaction, commands other than EXEC,
-/// DISCARD and MULTI are queued until EXEC runs them all.
-async fn handle_request(
-    request: Value,
-    db: &Db,
-    transaction: &mut Option<Vec<Vec<Vec<u8>>>>,
-) -> Value {
+/// DISCARD, MULTI and WATCH are queued until EXEC runs them all.
+async fn handle_request(request: Value, db: &Db, session: &mut Session) -> Value {
     let Some(command) = command_args(request) else {
         return Value::Error("ERR expected an array of bulk strings".into());
     };
     let name = command.first().map(|name| name.to_ascii_uppercase());
     match name.as_deref() {
         Some(b"MULTI") if command.len() == 1 => {
-            if transaction.is_some() {
+            if session.transaction.is_some() {
                 return Value::Error("ERR MULTI calls can not be nested".into());
             }
-            *transaction = Some(Vec::new());
+            session.transaction = Some(Vec::new());
             Value::SimpleString("OK".into())
         }
         Some(b"EXEC") if command.len() == 1 => {
-            let Some(queued) = transaction.take() else {
+            let Some(queued) = session.transaction.take() else {
                 return Value::Error("ERR EXEC without MULTI".into());
             };
-            // Unlike in Redis, other clients' commands can run in between these.
-            let mut replies = Vec::new();
-            for queued_command in &queued {
-                replies.push(handle_command(queued_command, db).await);
+            let watched = std::mem::take(&mut session.watched);
+            // Holding the lock throughout means no other client's command can run in
+            // between: the transaction happens all at once.
+            let mut db = db.lock().unwrap();
+            // If a WATCHed key has changed since, the transaction is called off.
+            if watched
+                .iter()
+                .any(|(key, version)| db.has_changed(key, *version))
+            {
+                return Value::NullArray;
             }
+            let replies = queued
+                .iter()
+                .map(|command| execute(&mut db, command))
+                .collect();
+            serve_blocked(&mut db);
             Value::Array(replies)
         }
-        Some(b"DISCARD") if command.len() == 1 => match transaction.take() {
-            Some(_) => Value::SimpleString("OK".into()),
+        Some(b"DISCARD") if command.len() == 1 => match session.transaction.take() {
+            Some(_) => {
+                session.watched.clear();
+                Value::SimpleString("OK".into())
+            }
             None => Value::Error("ERR DISCARD without MULTI".into()),
         },
+        Some(b"WATCH") if command.len() > 1 => {
+            if session.transaction.is_some() {
+                return Value::Error("ERR WATCH inside MULTI is not allowed".into());
+            }
+            let mut db = db.lock().unwrap();
+            for key in &command[1..] {
+                session.watched.push((key.clone(), db.watch(key)));
+            }
+            Value::SimpleString("OK".into())
+        }
+        // Inside a transaction, UNWATCH is queued like other commands instead.
+        Some(b"UNWATCH") if command.len() == 1 && session.transaction.is_none() => {
+            session.watched.clear();
+            Value::SimpleString("OK".into())
+        }
         Some(b"MULTI") => wrong_arity("multi"),
         Some(b"EXEC") => wrong_arity("exec"),
         Some(b"DISCARD") => wrong_arity("discard"),
-        _ => match transaction {
+        Some(b"WATCH") => wrong_arity("watch"),
+        _ => match &mut session.transaction {
             Some(queued) => {
                 queued.push(command);
                 Value::SimpleString("QUEUED".into())
@@ -187,7 +251,31 @@ async fn handle_request(
     }
 }
 
+/// Runs a command outside a transaction. BLPOP and XREAD BLOCK can wait here for data to
+/// arrive, without holding the lock; everything else runs straight through `execute`.
 async fn handle_command(command: &[Vec<u8>], db: &Db) -> Value {
+    if let [name, key, timeout] = command
+        && name.eq_ignore_ascii_case(b"BLPOP")
+        && let Ok(timeout) = parse_timeout(timeout)
+    {
+        return blocking_pop(db, key, timeout).await;
+    }
+    if let [name, args @ ..] = command
+        && name.eq_ignore_ascii_case(b"XREAD")
+        && let Ok(args) = parse_xread_args(args)
+        && let Some(timeout) = args.block
+    {
+        return blocking_read(db, args.keys, args.ids, timeout).await;
+    }
+    let mut db = db.lock().unwrap();
+    let reply = execute(&mut db, command);
+    serve_blocked(&mut db);
+    reply
+}
+
+/// Runs a command against the locked database. EXEC runs a whole transaction through
+/// this without letting go of the lock in between.
+fn execute(db: &mut Store, command: &[Vec<u8>]) -> Value {
     let Some((name, args)) = command.split_first() else {
         return Value::Error("ERR empty command".into());
     };
@@ -205,7 +293,8 @@ async fn handle_command(command: &[Vec<u8>], db: &Db) -> Value {
                         value: Data::String(value.clone()),
                         expires_at,
                     };
-                    db.lock().unwrap().entries.insert(key.clone(), entry);
+                    db.entries.insert(key.clone(), entry);
+                    db.touch(key);
                     Value::SimpleString("OK".into())
                 }
                 Err(msg) => Value::Error(msg.into()),
@@ -213,7 +302,7 @@ async fn handle_command(command: &[Vec<u8>], db: &Db) -> Value {
             _ => wrong_arity("set"),
         },
         b"GET" => match args {
-            [key] => match live_value(&mut db.lock().unwrap(), key) {
+            [key] => match live_value(db, key) {
                 Some(Data::String(value)) => Value::BulkString(value.clone()),
                 Some(_) => wrong_type(),
                 None => Value::NullBulkString,
@@ -237,7 +326,7 @@ async fn handle_command(command: &[Vec<u8>], db: &Db) -> Value {
                 let (Some(start), Some(stop)) = (parse_number(start), parse_number(stop)) else {
                     return Value::Error("ERR value is not an integer or out of range".into());
                 };
-                match live_value(&mut db.lock().unwrap(), key) {
+                match live_value(db, key) {
                     Some(Data::List(list)) => Value::Array(list_range(list, start, stop)),
                     Some(_) => wrong_type(),
                     None => Value::Array(vec![]),
@@ -246,7 +335,7 @@ async fn handle_command(command: &[Vec<u8>], db: &Db) -> Value {
             _ => wrong_arity("lrange"),
         },
         b"LLEN" => match args {
-            [key] => match live_value(&mut db.lock().unwrap(), key) {
+            [key] => match live_value(db, key) {
                 Some(Data::List(list)) => Value::Integer(list.len() as i64),
                 Some(_) => wrong_type(),
                 None => Value::Integer(0),
@@ -262,15 +351,17 @@ async fn handle_command(command: &[Vec<u8>], db: &Db) -> Value {
             _ => wrong_arity("lpop"),
         },
         b"BLPOP" => match args {
+            // Only inside a transaction does a valid BLPOP get here (`handle_command` runs
+            // it otherwise), and there it doesn't wait, as in Redis.
             [key, timeout] => match parse_timeout(timeout) {
-                Ok(timeout) => blocking_pop(db, key, timeout).await,
+                Ok(_) => pop_now(db, key),
                 Err(msg) => Value::Error(msg.into()),
             },
             _ => wrong_arity("blpop"),
         },
         b"TYPE" => match args {
             [key] => {
-                let kind = match live_value(&mut db.lock().unwrap(), key) {
+                let kind = match live_value(db, key) {
                     Some(Data::String(_)) => "string",
                     Some(Data::List(_)) => "list",
                     Some(Data::Stream(_)) => "stream",
@@ -294,7 +385,7 @@ async fn handle_command(command: &[Vec<u8>], db: &Db) -> Value {
                 ) else {
                     return invalid_stream_id();
                 };
-                match live_value(&mut db.lock().unwrap(), key) {
+                match live_value(db, key) {
                     Some(Data::Stream(stream)) => Value::Array(stream_range(stream, start, end)),
                     Some(_) => wrong_type(),
                     None => Value::Array(vec![]),
@@ -303,8 +394,10 @@ async fn handle_command(command: &[Vec<u8>], db: &Db) -> Value {
             _ => wrong_arity("xrange"),
         },
         b"XREAD" => match args {
+            // XREAD BLOCK only gets here inside a transaction (`handle_command` runs it
+            // otherwise), and there it doesn't wait, as in Redis.
             [_, _, _, ..] => match parse_xread_args(args) {
-                Ok(args) => read_streams(db, args).await,
+                Ok(XreadArgs { keys, ids, .. }) => read_now(db, keys, ids),
                 Err(msg) => Value::Error(msg.into()),
             },
             _ => wrong_arity("xread"),
@@ -312,6 +405,12 @@ async fn handle_command(command: &[Vec<u8>], db: &Db) -> Value {
         b"INCR" => match args {
             [key] => increment(db, key),
             _ => wrong_arity("incr"),
+        },
+        // `handle_request` handles UNWATCH outside a transaction. Inside one, it's left
+        // with nothing to do: EXEC has already stopped watching by the time it runs.
+        b"UNWATCH" => match args {
+            [] => Value::SimpleString("OK".into()),
+            _ => wrong_arity("unwatch"),
         },
         _ => Value::Error(format!(
             "ERR unknown command '{}'",
@@ -379,20 +478,24 @@ fn parse_timeout(arg: &[u8]) -> Result<Option<Duration>, &'static str> {
     }
 }
 
-/// Looks up the value at `key`. Expired keys are only removed once something tries to
-/// read them, so an expired key is removed here and treated as missing.
-fn live_value<'a>(db: &'a mut Store, key: &[u8]) -> Option<&'a mut Data> {
+/// Removes `key` if it has expired. Expired keys are only removed once something tries
+/// to read them, so this runs before every lookup.
+fn remove_if_expired(db: &mut Store, key: &[u8]) {
     if db.entries.get(key).is_some_and(Entry::is_expired) {
         db.entries.remove(key);
+        db.touch(key);
     }
+}
+
+/// Looks up the value at `key`, treating an expired key as missing.
+fn live_value<'a>(db: &'a mut Store, key: &[u8]) -> Option<&'a mut Data> {
+    remove_if_expired(db, key);
     db.entries.get_mut(key).map(|entry| &mut entry.value)
 }
 
 /// Like `live_value`, but first stores `new` at `key` if the key is missing or expired.
 fn live_value_or_insert<'a>(db: &'a mut Store, key: &[u8], new: Data) -> &'a mut Data {
-    if db.entries.get(key).is_some_and(Entry::is_expired) {
-        db.entries.remove(key);
-    }
+    remove_if_expired(db, key);
     let entry = db.entries.entry(key.to_vec()).or_insert(Entry {
         value: new,
         expires_at: None,
@@ -403,29 +506,28 @@ fn live_value_or_insert<'a>(db: &'a mut Store, key: &[u8], new: Data) -> &'a mut
 /// Pushes `elements` onto the list at `key` one at a time (so LPUSH a b c gives c b a),
 /// creating the list if needed. Replies with the list's new length.
 fn push_to_list(
-    db: &Db,
+    db: &mut Store,
     key: &[u8],
     elements: &[Vec<u8>],
     push: fn(&mut VecDeque<Vec<u8>>, Vec<u8>),
 ) -> Value {
-    let mut db = db.lock().unwrap();
-    let Data::List(list) = live_value_or_insert(&mut db, key, Data::List(VecDeque::new())) else {
+    let Data::List(list) = live_value_or_insert(db, key, Data::List(VecDeque::new())) else {
         return wrong_type();
     };
     for element in elements {
         push(list, element.clone());
     }
-    // Like Redis, reply with the length from before blocked clients take their elements.
     let len = list.len();
-    serve_blocked(&mut db, key);
+    db.touch(key);
+    // Clients blocked on the list get their elements once the command is done.
+    db.pushed.push(key.to_vec());
     Value::Integer(len as i64)
 }
 
 /// Removes elements from the front of the list at `key`: just the first one as a bulk
 /// string, or up to `count` of them as an array.
-fn pop_from_list(db: &Db, key: &[u8], count: Option<usize>) -> Value {
-    let mut db = db.lock().unwrap();
-    let list = match live_value(&mut db, key) {
+fn pop_from_list(db: &mut Store, key: &[u8], count: Option<usize>) -> Value {
+    let list = match live_value(db, key) {
         Some(Data::List(list)) => list,
         Some(_) => return wrong_type(),
         None if count.is_some() => return Value::NullArray,
@@ -444,54 +546,64 @@ fn pop_from_list(db: &Db, key: &[u8], count: Option<usize>) -> Value {
     if list.is_empty() {
         db.entries.remove(key);
     }
+    // Stored lists are never empty, so anything but a count of 0 popped something.
+    if count != Some(0) {
+        db.touch(key);
+    }
     reply
 }
 
-/// Hands elements from the front of the list at `key` to the clients blocked on it,
-/// longest-waiting first.
-fn serve_blocked(db: &mut Store, key: &[u8]) {
-    let Some(waiters) = db.blocked.get_mut(key) else {
-        return;
-    };
-    // Forget clients that have stopped waiting: they timed out or hung up.
-    waiters.retain(|waiter| !waiter.is_closed());
-    if let Some(Data::List(list)) = db.entries.get_mut(key).map(|entry| &mut entry.value) {
-        while !list.is_empty() {
-            let Some(waiter) = waiters.pop_front() else {
-                break;
-            };
-            let element = list.pop_front().unwrap();
-            // A client can still stop waiting after the retain above, in which case its
-            // element goes back to the list for the next one.
-            if let Err(element) = waiter.send(element) {
-                list.push_front(element);
+/// Hands elements from the lists pushed to by the command or transaction just run over
+/// to the clients blocked on them, longest-waiting first.
+fn serve_blocked(db: &mut Store) {
+    for key in std::mem::take(&mut db.pushed) {
+        let Some(waiters) = db.blocked.get_mut(&key) else {
+            continue;
+        };
+        // Forget clients that have stopped waiting: they timed out or hung up.
+        waiters.retain(|waiter| !waiter.is_closed());
+        let mut served = false;
+        if let Some(Data::List(list)) = db.entries.get_mut(&key).map(|entry| &mut entry.value) {
+            while !list.is_empty() {
+                let Some(waiter) = waiters.pop_front() else {
+                    break;
+                };
+                let element = list.pop_front().unwrap();
+                match waiter.send(element) {
+                    Ok(()) => served = true,
+                    // A client can still stop waiting after the retain above, in which
+                    // case its element goes back to the list for the next one.
+                    Err(element) => list.push_front(element),
+                }
+            }
+            if list.is_empty() {
+                db.entries.remove(&key);
             }
         }
-        if list.is_empty() {
-            db.entries.remove(key);
+        if waiters.is_empty() {
+            db.blocked.remove(&key);
         }
-    }
-    if waiters.is_empty() {
-        db.blocked.remove(key);
+        if served {
+            db.touch(&key);
+        }
     }
 }
 
-/// Pops the first element of the list at `key`, waiting for one to be pushed if the
-/// list is empty: for up to `timeout`, or forever if there is none.
+/// Pops the first element of the list at `key`, waiting for one to be pushed if there
+/// isn't one: for up to `timeout`, or forever if there's no timeout.
 async fn blocking_pop(db: &Db, key: &[u8], timeout: Option<Duration>) -> Value {
     let mut receiver = {
         let mut db = db.lock().unwrap();
-        if !matches!(live_value(&mut db, key), None | Some(Data::List(_))) {
-            return wrong_type();
+        match pop_now(&mut db, key) {
+            // Nothing to pop yet, so wait in line for a push.
+            Value::NullArray => {}
+            reply => return reply,
         }
         let (sender, receiver) = oneshot::channel();
-        db.blocked
-            .entry(key.to_vec())
-            .or_default()
-            .push_back(sender);
-        // Clients only wait while the list is empty, so if it has elements, this hands
-        // the first one straight to us.
-        serve_blocked(&mut db, key);
+        let waiters = db.blocked.entry(key.to_vec()).or_default();
+        // Forget clients that have stopped waiting while we're here.
+        waiters.retain(|waiter| !waiter.is_closed());
+        waiters.push_back(sender);
         receiver
     };
     let element = match timeout {
@@ -505,13 +617,33 @@ async fn blocking_pop(db: &Db, key: &[u8], timeout: Option<Duration>) -> Value {
             }
         },
     };
-    match element {
-        Some(element) => Value::Array(vec![
-            Value::BulkString(key.to_vec()),
-            Value::BulkString(element),
-        ]),
-        None => Value::NullArray,
+    element.map_or(Value::NullArray, |element| blpop_reply(key, element))
+}
+
+/// BLPOP without the waiting: pops the first element of the list at `key`, or replies
+/// with a null array if there's no list there.
+fn pop_now(db: &mut Store, key: &[u8]) -> Value {
+    let list = match live_value(db, key) {
+        Some(Data::List(list)) => list,
+        Some(_) => return wrong_type(),
+        None => return Value::NullArray,
+    };
+    let Some(element) = list.pop_front() else {
+        return Value::NullArray;
+    };
+    if list.is_empty() {
+        db.entries.remove(key);
     }
+    db.touch(key);
+    blpop_reply(key, element)
+}
+
+/// BLPOP's reply for `element`, popped from the list at `key`.
+fn blpop_reply(key: &[u8], element: Vec<u8>) -> Value {
+    Value::Array(vec![
+        Value::BulkString(key.to_vec()),
+        Value::BulkString(element),
+    ])
 }
 
 /// Returns the elements from `start` to `stop` inclusive. Negative indexes count back
@@ -530,7 +662,7 @@ fn list_range(list: &VecDeque<Vec<u8>>, start: i64, stop: i64) -> Vec<Value> {
 
 /// Appends an entry to the stream at `key`, creating the stream if needed, and replies
 /// with the new entry's ID.
-fn add_to_stream(db: &Db, key: &[u8], id: &[u8], fields: &[Vec<u8>]) -> Value {
+fn add_to_stream(db: &mut Store, key: &[u8], id: &[u8], fields: &[Vec<u8>]) -> Value {
     let Some((ms, seq)) = parse_xadd_id(id) else {
         return invalid_stream_id();
     };
@@ -538,8 +670,7 @@ fn add_to_stream(db: &Db, key: &[u8], id: &[u8], fields: &[Vec<u8>]) -> Value {
     if (ms, seq) == (Some(0), Some(0)) {
         return Value::Error("ERR The ID specified in XADD must be greater than 0-0".into());
     }
-    let mut db = db.lock().unwrap();
-    let Data::Stream(stream) = live_value_or_insert(&mut db, key, Data::Stream(Vec::new())) else {
+    let Data::Stream(stream) = live_value_or_insert(db, key, Data::Stream(Vec::new())) else {
         return wrong_type();
     };
     // A new stream counts as ending at 0-0, below every ID it can be given.
@@ -568,6 +699,7 @@ fn add_to_stream(db: &Db, key: &[u8], id: &[u8], fields: &[Vec<u8>]) -> Value {
         id,
         fields: fields.to_vec(),
     });
+    db.touch(key);
     db.stream_added.notify_waiters();
     Value::BulkString(id.to_string().into_bytes())
 }
@@ -659,30 +791,31 @@ fn parse_xread_args(args: &[Vec<u8>]) -> Result<XreadArgs<'_>, &'static str> {
     Ok(XreadArgs { keys, ids, block })
 }
 
-/// Replies with the entries after the ID given for each stream (`$` standing for the
-/// stream's last ID), leaving out streams that have none. If none of them has any, it
-/// waits for new entries while BLOCK allows, and otherwise replies with a null array.
-async fn read_streams(db: &Db, args: XreadArgs<'_>) -> Value {
-    let XreadArgs { keys, ids, block } = args;
+/// XREAD without the waiting: the entries after the ID given for each stream, or a null
+/// array if there are none.
+fn read_now(db: &mut Store, keys: &[Vec<u8>], ids: &[Vec<u8>]) -> Value {
+    match read_positions(db, keys, ids) {
+        Ok(afters) => entries_after(db, keys, &afters).unwrap_or(Value::NullArray),
+        Err(reply) => reply,
+    }
+}
+
+/// XREAD BLOCK outside a transaction: replies with the entries after the ID given for
+/// each stream as soon as there are any, waiting for up to `timeout` (or forever if
+/// there's no timeout) before replying with a null array.
+async fn blocking_read(
+    db: &Db,
+    keys: &[Vec<u8>],
+    ids: &[Vec<u8>],
+    timeout: Option<Duration>,
+) -> Value {
     // Work out the IDs up front, so that `$` keeps meaning the last ID from before any wait.
     let (afters, stream_added) = {
         let mut db = db.lock().unwrap();
-        let mut afters = Vec::new();
-        for (key, id) in keys.iter().zip(ids) {
-            let last = match live_value(&mut db, key) {
-                Some(Data::Stream(stream)) => stream.last().map_or(StreamId::MIN, |entry| entry.id),
-                Some(_) => return wrong_type(),
-                None => StreamId::MIN,
-            };
-            afters.push(match id.as_slice() {
-                b"$" => last,
-                id => match parse_stream_id(id, 0) {
-                    Some(id) => id,
-                    None => return invalid_stream_id(),
-                },
-            });
+        match read_positions(&mut db, keys, ids) {
+            Ok(afters) => (afters, db.stream_added.clone()),
+            Err(reply) => return reply,
         }
-        (afters, db.stream_added.clone())
     };
     let read = async {
         loop {
@@ -690,27 +823,46 @@ async fn read_streams(db: &Db, args: XreadArgs<'_>) -> Value {
             let added = stream_added.notified();
             tokio::pin!(added);
             added.as_mut().enable();
-            let streams = entries_after(&mut db.lock().unwrap(), keys, &afters);
-            if !streams.is_empty() {
-                return Value::Array(streams);
-            }
-            if block.is_none() {
-                return Value::NullArray;
+            let reply = entries_after(&mut db.lock().unwrap(), keys, &afters);
+            if let Some(reply) = reply {
+                return reply;
             }
             added.await;
         }
     };
-    match block {
-        Some(Some(timeout)) => tokio::time::timeout(timeout, read)
+    match timeout {
+        None => read.await,
+        Some(timeout) => tokio::time::timeout(timeout, read)
             .await
             .unwrap_or(Value::NullArray),
-        _ => read.await,
     }
 }
 
-/// The key and entries of each stream that has entries after the ID given for it, as XREAD
-/// replies with them.
-fn entries_after(db: &mut Store, keys: &[Vec<u8>], afters: &[StreamId]) -> Vec<Value> {
+/// Where XREAD reads each stream from: the entries after the ID given for it, where `$`
+/// stands for the stream's last ID.
+fn read_positions(
+    db: &mut Store,
+    keys: &[Vec<u8>],
+    ids: &[Vec<u8>],
+) -> Result<Vec<StreamId>, Value> {
+    let mut afters = Vec::new();
+    for (key, id) in keys.iter().zip(ids) {
+        let last = match live_value(db, key) {
+            Some(Data::Stream(stream)) => stream.last().map_or(StreamId::MIN, |entry| entry.id),
+            Some(_) => return Err(wrong_type()),
+            None => StreamId::MIN,
+        };
+        afters.push(match id.as_slice() {
+            b"$" => last,
+            id => parse_stream_id(id, 0).ok_or_else(invalid_stream_id)?,
+        });
+    }
+    Ok(afters)
+}
+
+/// XREAD's reply: the key and entries of each stream that has entries after the given
+/// position, or `None` if no stream has any.
+fn entries_after(db: &mut Store, keys: &[Vec<u8>], afters: &[StreamId]) -> Option<Value> {
     let mut streams = Vec::new();
     for (key, &after) in keys.iter().zip(afters) {
         let Some(Data::Stream(stream)) = live_value(db, key) else {
@@ -725,15 +877,17 @@ fn entries_after(db: &mut Store, keys: &[Vec<u8>], afters: &[StreamId]) -> Vec<V
             ]));
         }
     }
-    streams
+    if streams.is_empty() {
+        None
+    } else {
+        Some(Value::Array(streams))
+    }
 }
 
 /// Adds 1 to the integer stored at `key`, where a missing key counts as 0, and replies
 /// with the result.
-fn increment(db: &Db, key: &[u8]) -> Value {
-    let mut db = db.lock().unwrap();
-    let Data::String(value) = live_value_or_insert(&mut db, key, Data::String(b"0".to_vec()))
-    else {
+fn increment(db: &mut Store, key: &[u8]) -> Value {
+    let Data::String(value) = live_value_or_insert(db, key, Data::String(b"0".to_vec())) else {
         return wrong_type();
     };
     let Some(n) = parse_number::<i64>(value) else {
@@ -743,6 +897,7 @@ fn increment(db: &Db, key: &[u8]) -> Value {
         return Value::Error("ERR increment or decrement would overflow".into());
     };
     *value = n.to_string().into_bytes();
+    db.touch(key);
     Value::Integer(n)
 }
 
