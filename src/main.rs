@@ -28,6 +28,8 @@ struct Store {
     /// For WATCH: a counter for each key that has ever been watched, which goes up
     /// whenever the key is written to, deleted or expires.
     versions: HashMap<Vec<u8>, u64>,
+    /// Whether the server was started as a replica, with `--replicaof`.
+    is_replica: bool,
 }
 
 impl Store {
@@ -113,21 +115,42 @@ impl std::fmt::Display for StreamId {
 struct Config {
     /// The port to listen on, set with `--port`.
     port: u16,
+    /// The host and port of the master to replicate, set with `--replicaof`. A server
+    /// without one is a master itself.
+    replicaof: Option<(String, u16)>,
 }
 
-/// Reads the command-line arguments that follow the program's name: `[--port <port>]`.
+/// Reads the command-line arguments that follow the program's name:
+/// `[--port <port>] [--replicaof "<host> <port>"]`.
 fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Config, String> {
-    let mut config = Config { port: 6379 };
+    let mut config = Config {
+        port: 6379,
+        replicaof: None,
+    };
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--port" => {
                 let port = args.next().ok_or("--port needs a port number")?;
                 config.port = port.parse().map_err(|_| format!("invalid port: {port}"))?;
             }
+            "--replicaof" => {
+                let master = args.next().ok_or("--replicaof needs a host and port")?;
+                let invalid = format!("invalid master address: {master}");
+                config.replicaof = Some(parse_master(&master).ok_or(invalid)?);
+            }
             _ => return Err(format!("unknown argument: {arg}")),
         }
     }
     Ok(config)
+}
+
+/// Parses the value of `--replicaof`: a host and a port, with whitespace between them.
+fn parse_master(arg: &str) -> Option<(String, u16)> {
+    let parts: Vec<&str> = arg.split_whitespace().collect();
+    let [host, port] = parts[..] else {
+        return None;
+    };
+    Some((host.to_string(), port.parse().ok()?))
 }
 
 #[tokio::main]
@@ -137,7 +160,10 @@ async fn main() {
         std::process::exit(1);
     });
     let listener = TcpListener::bind(("127.0.0.1", config.port)).await.unwrap();
-    let db = Db::default();
+    let db = Db::new(Mutex::new(Store {
+        is_replica: config.replicaof.is_some(),
+        ..Store::default()
+    }));
 
     loop {
         let stream = listener.accept().await;
@@ -437,7 +463,7 @@ fn execute(db: &mut Store, command: &[Vec<u8>]) -> Value {
             [] => Value::SimpleString("OK".into()),
             _ => wrong_arity("unwatch"),
         },
-        b"INFO" => info(args),
+        b"INFO" => info(db, args),
         _ => Value::Error(format!(
             "ERR unknown command '{}'",
             String::from_utf8_lossy(name)
@@ -929,7 +955,7 @@ fn increment(db: &mut Store, key: &[u8]) -> Value {
 
 /// INFO's reply: the sections named, or the default ones if none are. Replication is the
 /// only section so far, and as in Redis, a section that doesn't exist is just left out.
-fn info(sections: &[Vec<u8>]) -> Value {
+fn info(db: &Store, sections: &[Vec<u8>]) -> Value {
     let replication = sections.is_empty()
         || sections.iter().any(|section| {
             matches!(
@@ -937,8 +963,11 @@ fn info(sections: &[Vec<u8>]) -> Value {
                 b"replication" | b"default" | b"all" | b"everything"
             )
         });
-    let text = if replication { "role:master" } else { "" };
-    Value::BulkString(text.into())
+    if !replication {
+        return Value::BulkString(Vec::new());
+    }
+    let role = if db.is_replica { "slave" } else { "master" };
+    Value::BulkString(format!("role:{role}").into_bytes())
 }
 
 /// Clients send each command as an array of bulk strings, e.g. ["ECHO", "hey"].
@@ -974,11 +1003,41 @@ mod tests {
     }
 
     #[test]
+    fn replicates_nothing_by_default() {
+        assert_eq!(parse(&[]).unwrap().replicaof, None);
+    }
+
+    #[test]
+    fn reads_the_master_to_replicate() {
+        for args in [
+            ["--port", "6380", "--replicaof", "localhost 6379"],
+            ["--replicaof", "localhost 6379", "--port", "6380"],
+        ] {
+            let config = parse(&args).unwrap();
+            assert_eq!(config.port, 6380);
+            assert_eq!(config.replicaof, Some(("localhost".to_string(), 6379)));
+        }
+    }
+
+    #[test]
     fn rejects_bad_arguments() {
         let error = |args: &[&str]| parse(args).err().unwrap();
         assert_eq!(error(&["--port"]), "--port needs a port number");
         assert_eq!(error(&["--port", "abc"]), "invalid port: abc");
         assert_eq!(error(&["--port", "70000"]), "invalid port: 70000");
         assert_eq!(error(&["--bogus"]), "unknown argument: --bogus");
+        assert_eq!(error(&["--replicaof"]), "--replicaof needs a host and port");
+        for master in [
+            "",
+            "localhost",
+            "localhost abc",
+            "localhost 70000",
+            "a b 6379",
+        ] {
+            assert_eq!(
+                error(&["--replicaof", master]),
+                format!("invalid master address: {master}")
+            );
+        }
     }
 }
