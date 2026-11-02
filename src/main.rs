@@ -108,12 +108,14 @@ async fn main() {
 
 async fn handle_connection(mut stream: TcpStream, db: Db) -> Result<()> {
     let mut buf = BytesMut::with_capacity(512);
+    // The commands queued for EXEC while the client is inside a MULTI transaction.
+    let mut transaction = None;
     loop {
         // A read can end partway through a command or hold several pipelined ones,
         // so answer every complete command buffered so far, then read more.
         while let Some((request, len)) = Value::parse(&buf)? {
             buf.advance(len);
-            let command = handle_command(request, &db);
+            let command = handle_request(request, &db, &mut transaction);
             tokio::pin!(command);
             // BLPOP can wait indefinitely, so keep reading meanwhile. If the client hangs
             // up, the wait is dropped rather than later taking an element nobody receives.
@@ -138,11 +140,55 @@ async fn handle_connection(mut stream: TcpStream, db: Db) -> Result<()> {
     }
 }
 
-async fn handle_command(request: Value, db: &Db) -> Value {
-    let Some(args) = command_args(request) else {
+/// Handles a client's request. Inside a MULTI transaction, commands other than EXEC,
+/// DISCARD and MULTI are queued until EXEC runs them all.
+async fn handle_request(
+    request: Value,
+    db: &Db,
+    transaction: &mut Option<Vec<Vec<Vec<u8>>>>,
+) -> Value {
+    let Some(command) = command_args(request) else {
         return Value::Error("ERR expected an array of bulk strings".into());
     };
-    let Some((name, args)) = args.split_first() else {
+    let name = command.first().map(|name| name.to_ascii_uppercase());
+    match name.as_deref() {
+        Some(b"MULTI") if command.len() == 1 => {
+            if transaction.is_some() {
+                return Value::Error("ERR MULTI calls can not be nested".into());
+            }
+            *transaction = Some(Vec::new());
+            Value::SimpleString("OK".into())
+        }
+        Some(b"EXEC") if command.len() == 1 => {
+            let Some(queued) = transaction.take() else {
+                return Value::Error("ERR EXEC without MULTI".into());
+            };
+            // Unlike in Redis, other clients' commands can run in between these.
+            let mut replies = Vec::new();
+            for queued_command in &queued {
+                replies.push(handle_command(queued_command, db).await);
+            }
+            Value::Array(replies)
+        }
+        Some(b"DISCARD") if command.len() == 1 => match transaction.take() {
+            Some(_) => Value::SimpleString("OK".into()),
+            None => Value::Error("ERR DISCARD without MULTI".into()),
+        },
+        Some(b"MULTI") => wrong_arity("multi"),
+        Some(b"EXEC") => wrong_arity("exec"),
+        Some(b"DISCARD") => wrong_arity("discard"),
+        _ => match transaction {
+            Some(queued) => {
+                queued.push(command);
+                Value::SimpleString("QUEUED".into())
+            }
+            None => handle_command(&command, db).await,
+        },
+    }
+}
+
+async fn handle_command(command: &[Vec<u8>], db: &Db) -> Value {
+    let Some((name, args)) = command.split_first() else {
         return Value::Error("ERR empty command".into());
     };
 
