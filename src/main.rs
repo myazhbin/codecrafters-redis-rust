@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::oneshot;
+use tokio::sync::{Notify, oneshot};
 
 type Db = Arc<Mutex<Store>>;
 
@@ -20,6 +20,8 @@ struct Store {
     /// Clients blocked in BLPOP on each key, longest-waiting first. Each one is sent the
     /// element it pops.
     blocked: HashMap<Vec<u8>, VecDeque<oneshot::Sender<Vec<u8>>>>,
+    /// Notified whenever an entry is added to a stream, so that blocked XREADs look again.
+    stream_added: Arc<Notify>,
 }
 
 struct Entry {
@@ -255,22 +257,10 @@ async fn handle_command(request: Value, db: &Db) -> Value {
             _ => wrong_arity("xrange"),
         },
         b"XREAD" => match args {
-            [option, streams @ ..]
-                if option.eq_ignore_ascii_case(b"STREAMS") && streams.len() >= 2 =>
-            {
-                // STREAMS is followed by all the keys, then an ID for each of them.
-                if !streams.len().is_multiple_of(2) {
-                    return Value::Error(
-                        "ERR Unbalanced 'xread' list of streams: for each stream key an ID or \
-                         '$' must be specified."
-                            .into(),
-                    );
-                }
-                let (keys, ids) = streams.split_at(streams.len() / 2);
-                read_streams(db, keys, ids)
-            }
-            // Options before STREAMS, like COUNT and BLOCK, aren't supported yet.
-            [_, _, _, ..] => Value::Error("ERR syntax error".into()),
+            [_, _, _, ..] => match parse_xread_args(args) {
+                Ok(args) => read_streams(db, args).await,
+                Err(msg) => Value::Error(msg.into()),
+            },
             _ => wrong_arity("xread"),
         },
         _ => Value::Error(format!(
@@ -528,6 +518,7 @@ fn add_to_stream(db: &Db, key: &[u8], id: &[u8], fields: &[Vec<u8>]) -> Value {
         id,
         fields: fields.to_vec(),
     });
+    db.stream_added.notify_waiters();
     Value::BulkString(id.to_string().into_bytes())
 }
 
@@ -574,24 +565,106 @@ fn stream_range(stream: &[StreamEntry], start: StreamId, end: StreamId) -> Vec<V
         .collect()
 }
 
-/// Returns, for each stream, the entries with IDs after the one given for it, where `$`
-/// stands for the stream's last ID. Streams without such entries are left out, and if
-/// that leaves none, the reply is a null array.
-fn read_streams(db: &Db, keys: &[Vec<u8>], ids: &[Vec<u8>]) -> Value {
-    let mut db = db.lock().unwrap();
+/// XREAD's arguments, as parsed by `parse_xread_args`.
+struct XreadArgs<'a> {
+    keys: &'a [Vec<u8>],
+    ids: &'a [Vec<u8>],
+    /// How long to wait for new entries if there are none yet: `None` without BLOCK, and
+    /// `Some(None)` to wait forever (BLOCK 0).
+    block: Option<Option<Duration>>,
+}
+
+/// Parses XREAD's arguments: `[BLOCK <milliseconds>] STREAMS <key>... <id>...`.
+fn parse_xread_args(args: &[Vec<u8>]) -> Result<XreadArgs<'_>, &'static str> {
+    let (block, args) = match args {
+        [option, ms, rest @ ..] if option.eq_ignore_ascii_case(b"BLOCK") => {
+            let Some(ms) = parse_number::<i64>(ms) else {
+                return Err("ERR timeout is not an integer or out of range");
+            };
+            if ms < 0 {
+                return Err("ERR timeout is negative");
+            }
+            let timeout = (ms > 0).then(|| Duration::from_millis(ms as u64));
+            (Some(timeout), rest)
+        }
+        _ => (None, args),
+    };
+    let streams = match args {
+        [option, streams @ ..]
+            if option.eq_ignore_ascii_case(b"STREAMS") && !streams.is_empty() =>
+        {
+            streams
+        }
+        // Other options, such as COUNT, aren't supported.
+        _ => return Err("ERR syntax error"),
+    };
+    // STREAMS is followed by all the keys, then an ID for each of them.
+    if !streams.len().is_multiple_of(2) {
+        return Err(
+            "ERR Unbalanced 'xread' list of streams: for each stream key an ID or '$' must be \
+             specified.",
+        );
+    }
+    let (keys, ids) = streams.split_at(streams.len() / 2);
+    Ok(XreadArgs { keys, ids, block })
+}
+
+/// Replies with the entries after the ID given for each stream (`$` standing for the
+/// stream's last ID), leaving out streams that have none. If none of them has any, it
+/// waits for new entries while BLOCK allows, and otherwise replies with a null array.
+async fn read_streams(db: &Db, args: XreadArgs<'_>) -> Value {
+    let XreadArgs { keys, ids, block } = args;
+    // Work out the IDs up front, so that `$` keeps meaning the last ID from before any wait.
+    let (afters, stream_added) = {
+        let mut db = db.lock().unwrap();
+        let mut afters = Vec::new();
+        for (key, id) in keys.iter().zip(ids) {
+            let last = match live_value(&mut db, key) {
+                Some(Data::Stream(stream)) => stream.last().map_or(StreamId::MIN, |entry| entry.id),
+                Some(_) => return wrong_type(),
+                None => StreamId::MIN,
+            };
+            afters.push(match id.as_slice() {
+                b"$" => last,
+                id => match parse_stream_id(id, 0) {
+                    Some(id) => id,
+                    None => return invalid_stream_id(),
+                },
+            });
+        }
+        (afters, db.stream_added.clone())
+    };
+    let read = async {
+        loop {
+            // Listen for new entries before looking, so that one added in between isn't missed.
+            let added = stream_added.notified();
+            tokio::pin!(added);
+            added.as_mut().enable();
+            let streams = entries_after(&mut db.lock().unwrap(), keys, &afters);
+            if !streams.is_empty() {
+                return Value::Array(streams);
+            }
+            if block.is_none() {
+                return Value::NullArray;
+            }
+            added.await;
+        }
+    };
+    match block {
+        Some(Some(timeout)) => tokio::time::timeout(timeout, read)
+            .await
+            .unwrap_or(Value::NullArray),
+        _ => read.await,
+    }
+}
+
+/// The key and entries of each stream that has entries after the ID given for it, as XREAD
+/// replies with them.
+fn entries_after(db: &mut Store, keys: &[Vec<u8>], afters: &[StreamId]) -> Vec<Value> {
     let mut streams = Vec::new();
-    for (key, id) in keys.iter().zip(ids) {
-        let stream = match live_value(&mut db, key) {
-            Some(Data::Stream(stream)) => stream.as_slice(),
-            Some(_) => return wrong_type(),
-            None => &[],
-        };
-        let after = match id.as_slice() {
-            b"$" => stream.last().map_or(StreamId::MIN, |entry| entry.id),
-            id => match parse_stream_id(id, 0) {
-                Some(id) => id,
-                None => return invalid_stream_id(),
-            },
+    for (key, &after) in keys.iter().zip(afters) {
+        let Some(Data::Stream(stream)) = live_value(db, key) else {
+            continue;
         };
         let first = stream.partition_point(|entry| entry.id <= after);
         if first < stream.len() {
@@ -602,11 +675,7 @@ fn read_streams(db: &Db, keys: &[Vec<u8>], ids: &[Vec<u8>]) -> Value {
             ]));
         }
     }
-    if streams.is_empty() {
-        Value::NullArray
-    } else {
-        Value::Array(streams)
-    }
+    streams
 }
 
 /// Clients send each command as an array of bulk strings, e.g. ["ECHO", "hey"].
