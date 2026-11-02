@@ -7,9 +7,10 @@
 
 set -u
 bin=${1:-/tmp/codecrafters-build-redis-rust/release/codecrafters-redis}
-# A test can set `port` before sourcing this file, to start the server with --port.
-# Otherwise it starts without arguments, so that the default port gets tested too.
-port=${port:-6379}
+# A test can set `port` before sourcing this file to start the server with --port, and
+# `cargo test` sets TEST_PORT to give each test its own port, so they can run at once.
+# Otherwise the server starts without arguments, so that the default port gets tested.
+port=${port:-${TEST_PORT:-6379}}
 failures=0
 
 wrongtype='-WRONGTYPE Operation against a key holding the wrong kind of value\r\n'
@@ -82,7 +83,7 @@ finish() {
 }
 
 if [ ! -x "$bin" ]; then
-  echo "No server binary at $bin; tests/run.sh builds it before running the tests." >&2
+  echo "No server binary at $bin; build it with ./your_program.sh, or use cargo test." >&2
   exit 1
 fi
 if nc -z 127.0.0.1 "$port" 2>/dev/null; then

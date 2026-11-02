@@ -1,8 +1,8 @@
 """Helpers shared by the tests/*.py end-to-end tests.
 
 Each test starts the server binary given as its first argument (by default, the one
-./your_program.sh builds) on port 6379, talks to it over real client connections, and
-compares the raw reply bytes with the expected RESP.
+./your_program.sh builds), talks to it over real client connections, and compares the
+raw reply bytes with the expected RESP.
 """
 
 import os
@@ -12,7 +12,9 @@ import sys
 import time
 from contextlib import contextmanager
 
-ADDRESS = ("127.0.0.1", 6379)
+# `cargo test` sets TEST_PORT to give each test its own port, so that they can run at once.
+PORT = int(os.environ.get("TEST_PORT", "6379"))
+ADDRESS = ("127.0.0.1", PORT)
 DEFAULT_BINARY = "/tmp/codecrafters-build-redis-rust/release/codecrafters-redis"
 OK = b"+OK\r\n"
 QUEUED = b"+QUEUED\r\n"
@@ -122,10 +124,12 @@ def running_server():
     """Runs the server for the duration of the `with` block."""
     binary = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_BINARY
     if not os.access(binary, os.X_OK):
-        sys.exit(f"No server binary at {binary}; tests/run.sh builds it before running the tests.")
+        sys.exit(f"No server binary at {binary}; build it with ./your_program.sh, or use cargo test.")
     if port_open():
-        sys.exit("Something is already listening on port 6379; stop it before running the tests.")
-    server = subprocess.Popen([binary], stdout=subprocess.DEVNULL)
+        sys.exit(f"Something is already listening on port {PORT}; stop it before running the tests.")
+    # On the default port, the server starts without arguments, so the default gets tested.
+    args = [binary] if PORT == 6379 else [binary, "--port", str(PORT)]
+    server = subprocess.Popen(args, stdout=subprocess.DEVNULL)
     try:
         for _ in range(100):
             if port_open():

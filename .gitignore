@@ -8,3 +8,6 @@ target/
 
 # MSVC Windows builds of rustc generate these, which store debugging information
 *.pdb
+
+# Python's bytecode cache, which running the test scripts directly can leave behind
+__pycache__/

@@ -437,6 +437,7 @@ fn execute(db: &mut Store, command: &[Vec<u8>]) -> Value {
             [] => Value::SimpleString("OK".into()),
             _ => wrong_arity("unwatch"),
         },
+        b"INFO" => info(args),
         _ => Value::Error(format!(
             "ERR unknown command '{}'",
             String::from_utf8_lossy(name)
@@ -924,6 +925,20 @@ fn increment(db: &mut Store, key: &[u8]) -> Value {
     *value = n.to_string().into_bytes();
     db.touch(key);
     Value::Integer(n)
+}
+
+/// INFO's reply: the sections named, or the default ones if none are. Replication is the
+/// only section so far, and as in Redis, a section that doesn't exist is just left out.
+fn info(sections: &[Vec<u8>]) -> Value {
+    let replication = sections.is_empty()
+        || sections.iter().any(|section| {
+            matches!(
+                section.to_ascii_lowercase().as_slice(),
+                b"replication" | b"default" | b"all" | b"everything"
+            )
+        });
+    let text = if replication { "role:master" } else { "" };
+    Value::BulkString(text.into())
 }
 
 /// Clients send each command as an array of bulk strings, e.g. ["ECHO", "hey"].
