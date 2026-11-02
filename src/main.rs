@@ -140,6 +140,26 @@ fn handle_command(request: Value, db: &Db) -> Value {
             }
             _ => wrong_arity("rpush"),
         },
+        b"LRANGE" => match args {
+            [key, start, stop] => {
+                let (Some(start), Some(stop)) = (parse_integer(start), parse_integer(stop)) else {
+                    return Value::Error("ERR value is not an integer or out of range".into());
+                };
+                let mut db = db.lock().unwrap();
+                match db.get(key) {
+                    Some(entry) if entry.is_expired() => {
+                        db.remove(key);
+                        Value::Array(vec![])
+                    }
+                    Some(entry) => match &entry.value {
+                        Data::List(list) => Value::Array(list_range(list, start, stop)),
+                        Data::String(_) => wrong_type(),
+                    },
+                    None => Value::Array(vec![]),
+                }
+            }
+            _ => wrong_arity("lrange"),
+        },
         _ => Value::Error(format!(
             "ERR unknown command '{}'",
             String::from_utf8_lossy(name)
@@ -170,10 +190,7 @@ fn parse_expiry(options: &[Vec<u8>]) -> Result<Option<Instant>, &'static str> {
         b"PX" => Duration::from_millis,
         _ => return Err("ERR syntax error"),
     };
-    let Some(amount) = std::str::from_utf8(amount)
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-    else {
+    let Some(amount) = parse_integer::<u64>(amount) else {
         return Err("ERR value is not an integer or out of range");
     };
     // checked_add so that an absurdly long expiry is an error rather than a panic.
@@ -181,6 +198,25 @@ fn parse_expiry(options: &[Vec<u8>]) -> Result<Option<Instant>, &'static str> {
         Some(expires_at) if amount > 0 => Ok(Some(expires_at)),
         _ => Err("ERR invalid expire time in 'set' command"),
     }
+}
+
+/// Parses an integer argument, such as an expiry time or a list index.
+fn parse_integer<T: std::str::FromStr>(arg: &[u8]) -> Option<T> {
+    std::str::from_utf8(arg).ok()?.parse().ok()
+}
+
+/// Returns the elements from `start` to `stop` inclusive. Negative indexes count back
+/// from the end, and any part of the range that falls outside the list is ignored.
+fn list_range(list: &VecDeque<Vec<u8>>, start: i64, stop: i64) -> Vec<Value> {
+    let len = list.len() as i64;
+    let resolve = |index: i64| if index < 0 { len + index } else { index };
+    let (start, stop) = (resolve(start).max(0), resolve(stop).min(len - 1));
+    if start > stop {
+        return Vec::new();
+    }
+    list.range(start as usize..=stop as usize)
+        .map(|element| Value::BulkString(element.clone()))
+        .collect()
 }
 
 /// Clients send each command as an array of bulk strings, e.g. ["ECHO", "hey"].
