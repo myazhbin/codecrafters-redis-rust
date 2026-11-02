@@ -2,7 +2,7 @@
 
 mod resp;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use bytes::{Buf, BytesMut};
 use resp::Value;
 use std::collections::{HashMap, VecDeque};
@@ -165,9 +165,9 @@ async fn main() {
         ..Store::default()
     }));
 
-    if let Some((host, port)) = config.replicaof {
+    if let Some((host, master_port)) = config.replicaof {
         tokio::spawn(async move {
-            if let Err(e) = connect_to_master(&host, port).await {
+            if let Err(e) = connect_to_master(&host, master_port, config.port).await {
                 println!("master connection error: {}", e);
             }
         });
@@ -194,15 +194,43 @@ async fn main() {
     }
 }
 
-/// Connects a replica to its master and starts the handshake by sending PING. There's no
-/// more to the handshake yet, so it then just stays connected until the master hangs up,
-/// ignoring anything the master sends.
-async fn connect_to_master(host: &str, port: u16) -> Result<()> {
+/// Connects a replica to its master and goes through the handshake, waiting for the
+/// reply to each command before sending the next. There's no more to it yet, so the
+/// replica then just stays connected until the master hangs up, ignoring what it sends.
+async fn connect_to_master(host: &str, port: u16, listening_port: u16) -> Result<()> {
     let mut master = TcpStream::connect((host, port)).await?;
-    let ping = Value::Array(vec![Value::BulkString(b"PING".to_vec())]);
-    master.write_all(&ping.encode()).await?;
+    let mut buf = BytesMut::with_capacity(512);
+    let listening_port = listening_port.to_string();
+    let handshake = [
+        vec!["PING"],
+        vec!["REPLCONF", "listening-port", &listening_port],
+        vec!["REPLCONF", "capa", "psync2"],
+    ];
+    for command in handshake {
+        let args = command
+            .iter()
+            .map(|arg| Value::BulkString(arg.as_bytes().to_vec()));
+        let request = Value::Array(args.collect()).encode();
+        master.write_all(&request).await?;
+        if let Value::Error(msg) = read_reply(&mut master, &mut buf).await? {
+            bail!("the reply to {} was: {msg}", command.join(" "));
+        }
+    }
     tokio::io::copy(&mut master, &mut tokio::io::sink()).await?;
     Ok(())
+}
+
+/// Reads the master's next reply, however many reads it takes for all of it to arrive.
+async fn read_reply(master: &mut TcpStream, buf: &mut BytesMut) -> Result<Value> {
+    loop {
+        if let Some((reply, len)) = Value::parse(buf)? {
+            buf.advance(len);
+            return Ok(reply);
+        }
+        if master.read_buf(buf).await? == 0 {
+            bail!("the master hung up during the handshake");
+        }
+    }
 }
 
 /// What the server keeps track of for each client connection.

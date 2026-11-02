@@ -4,12 +4,26 @@ with the test playing the master."""
 
 import socket
 import time
+from contextlib import contextmanager
 
 from helpers import PORT, Client, check, command, expect, finish, running_server
 
 # `cargo test` gives each test a port of its own, all well below this one's.
 MASTER_PORT = PORT + 100
 AS_REPLICA = ("--replicaof", f"localhost {MASTER_PORT}")
+
+PING = b"*1\r\n$4\r\nPING\r\n"
+LISTENING_PORT = b"*3\r\n$8\r\nREPLCONF\r\n$14\r\nlistening-port\r\n$%d\r\n%d\r\n" % (len(str(PORT)), PORT)
+CAPA = b"*3\r\n$8\r\nREPLCONF\r\n$4\r\ncapa\r\n$6\r\npsync2\r\n"
+
+
+@contextmanager
+def connected_replica():
+    """Runs a replica, and gives the test the master's end of the connection it makes."""
+    with socket.create_server(("127.0.0.1", MASTER_PORT)) as listener:
+        listener.settimeout(2.0)
+        with running_server(*AS_REPLICA):
+            yield Client(listener.accept()[0])
 
 
 def stays_quiet(connection, wait=0.3):
@@ -22,17 +36,31 @@ def stays_quiet(connection, wait=0.3):
     return False
 
 
+def hangs_up(connection, wait=1.0):
+    """Whether the other end hangs up within `wait` seconds, having sent nothing more."""
+    connection.sock.settimeout(wait)
+    try:
+        return connection.sock.recv(1) == b""
+    except socket.timeout:
+        return False
+
+
 print("== with no master to connect to, the replica still serves clients")
 with running_server(*AS_REPLICA):
     command(b"+PONG\r\n", "PING")
     command(b"+OK\r\n", "SET", "k", "v")
     command(b"$1\r\nv\r\n", "GET", "k")
 
-with socket.create_server(("127.0.0.1", MASTER_PORT)) as listener, running_server(*AS_REPLICA):
-    print("== stage test: the replica connects to the master and sends PING")
-    listener.settimeout(2.0)
-    master = Client(listener.accept()[0])
-    expect(master, b"*1\r\n$4\r\nPING\r\n", "the master receives PING as a RESP array")
+with connected_replica() as master:
+    print("== stage test: each handshake command waits for the reply to the one before")
+    expect(master, PING, "the master receives PING as a RESP array")
+    check("the replica waits for the reply to PING", stays_quiet(master))
+    master.sock.sendall(b"+PONG\r\n")
+    expect(master, LISTENING_PORT, f"then REPLCONF listening-port {PORT}")
+    check("the replica waits for the reply to that", stays_quiet(master))
+    master.sock.sendall(b"+OK\r\n")
+    expect(master, CAPA, "then REPLCONF capa psync2")
+    master.sock.sendall(b"+OK\r\n")
     check("the replica then stays connected, sending nothing more", stays_quiet(master))
 
     print("== it serves clients while connected to the master")
@@ -40,7 +68,7 @@ with socket.create_server(("127.0.0.1", MASTER_PORT)) as listener, running_serve
     command(b"+OK\r\n", "SET", "k", "v")
     command(b"$1\r\nv\r\n", "GET", "k")
 
-    print("== the master's reply doesn't disturb it")
+    print("== what the master sends after the handshake doesn't disturb it")
     master.sock.sendall(b"+PONG\r\n")
     check("the replica stays connected, sending nothing more", stays_quiet(master))
     command(b"+PONG\r\n", "PING")
@@ -50,5 +78,29 @@ with socket.create_server(("127.0.0.1", MASTER_PORT)) as listener, running_serve
     time.sleep(0.1)
     command(b"+PONG\r\n", "PING")
     command(b"$1\r\nv\r\n", "GET", "k")
+
+with connected_replica() as master:
+    print("== a reply that arrives in pieces is waited for")
+    expect(master, PING, "the master receives PING")
+    master.sock.sendall(b"+PO")
+    check("the replica doesn't go on after part of a reply", stays_quiet(master))
+    master.sock.sendall(b"NG\r\n")
+    expect(master, LISTENING_PORT, "it goes on once the rest of the reply arrives")
+
+with connected_replica() as master:
+    print("== an error reply ends the handshake")
+    expect(master, PING, "the master receives PING")
+    master.sock.sendall(b"+PONG\r\n")
+    expect(master, LISTENING_PORT, "then REPLCONF listening-port")
+    master.sock.sendall(b"-ERR no thanks\r\n")
+    check("the replica hangs up, without sending REPLCONF capa", hangs_up(master))
+    command(b"+PONG\r\n", "PING")
+
+with connected_replica() as master:
+    print("== a master that hangs up during the handshake just ends it")
+    expect(master, PING, "the master receives PING")
+    master.close()
+    time.sleep(0.1)
+    command(b"+PONG\r\n", "PING")
 
 finish()
