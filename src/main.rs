@@ -195,8 +195,8 @@ async fn main() {
 }
 
 /// Connects a replica to its master and goes through the handshake, waiting for the
-/// reply to each command before sending the next. There's no more to it yet, so the
-/// replica then just stays connected until the master hangs up, ignoring what it sends.
+/// reply to each command before sending the next. Nothing uses what the master sends
+/// after that yet, so the replica then just ignores it until the master hangs up.
 async fn connect_to_master(host: &str, port: u16, listening_port: u16) -> Result<()> {
     let mut master = TcpStream::connect((host, port)).await?;
     let mut buf = BytesMut::with_capacity(512);
@@ -205,6 +205,8 @@ async fn connect_to_master(host: &str, port: u16, listening_port: u16) -> Result
         vec!["PING"],
         vec!["REPLCONF", "listening-port", &listening_port],
         vec!["REPLCONF", "capa", "psync2"],
+        // The replica doesn't know the master's ID yet, and has none of its data.
+        vec!["PSYNC", "?", "-1"],
     ];
     for command in handshake {
         let args = command
