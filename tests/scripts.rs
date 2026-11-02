@@ -36,6 +36,7 @@ script_tests! {
     watch: "watch.py",
     port: "port.sh",
     info: "info.sh",
+    handshake: "handshake.py",
 }
 
 /// Runs tests/<script>, failing if it reports a failure, with the script's output shown.

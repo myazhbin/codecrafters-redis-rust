@@ -165,6 +165,14 @@ async fn main() {
         ..Store::default()
     }));
 
+    if let Some((host, port)) = config.replicaof {
+        tokio::spawn(async move {
+            if let Err(e) = connect_to_master(&host, port).await {
+                println!("master connection error: {}", e);
+            }
+        });
+    }
+
     loop {
         let stream = listener.accept().await;
 
@@ -184,6 +192,17 @@ async fn main() {
             }
         }
     }
+}
+
+/// Connects a replica to its master and starts the handshake by sending PING. There's no
+/// more to the handshake yet, so it then just stays connected until the master hangs up,
+/// ignoring anything the master sends.
+async fn connect_to_master(host: &str, port: u16) -> Result<()> {
+    let mut master = TcpStream::connect((host, port)).await?;
+    let ping = Value::Array(vec![Value::BulkString(b"PING".to_vec())]);
+    master.write_all(&ping.encode()).await?;
+    tokio::io::copy(&mut master, &mut tokio::io::sink()).await?;
+    Ok(())
 }
 
 /// What the server keeps track of for each client connection.

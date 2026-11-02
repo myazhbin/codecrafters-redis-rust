@@ -48,10 +48,11 @@ def streams(*items):
 
 
 class Client:
-    """One client connection to the server."""
+    """One client connection to the server. A test playing a master instead passes in the
+    socket it accepted from a replica, and uses this as its end of that connection."""
 
-    def __init__(self):
-        self.sock = socket.create_connection(ADDRESS)
+    def __init__(self, sock=None):
+        self.sock = sock or socket.create_connection(ADDRESS)
 
     def send(self, *args):
         self.sock.sendall(encode(*args))
@@ -120,8 +121,8 @@ def port_open():
 
 
 @contextmanager
-def running_server():
-    """Runs the server for the duration of the `with` block."""
+def running_server(*extra_args):
+    """Runs the server, with any extra arguments, for the duration of the `with` block."""
     binary = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_BINARY
     if not os.access(binary, os.X_OK):
         sys.exit(f"No server binary at {binary}; build it with ./your_program.sh, or use cargo test.")
@@ -129,7 +130,7 @@ def running_server():
         sys.exit(f"Something is already listening on port {PORT}; stop it before running the tests.")
     # On the default port, the server starts without arguments, so the default gets tested.
     args = [binary] if PORT == 6379 else [binary, "--port", str(PORT)]
-    server = subprocess.Popen(args, stdout=subprocess.DEVNULL)
+    server = subprocess.Popen([*args, *extra_args], stdout=subprocess.DEVNULL)
     try:
         for _ in range(100):
             if port_open():
