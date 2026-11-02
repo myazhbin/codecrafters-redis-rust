@@ -7,7 +7,7 @@ use bytes::{Buf, BytesMut};
 use resp::Value;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
@@ -36,6 +36,28 @@ impl Entry {
 enum Data {
     String(Vec<u8>),
     List(VecDeque<Vec<u8>>),
+    Stream(Vec<StreamEntry>),
+}
+
+struct StreamEntry {
+    id: StreamId,
+    /// The entry's field-value pairs, flattened: field1, value1, field2, value2, ...
+    #[expect(dead_code, reason = "XRANGE and XREAD, still to come, will read these")]
+    fields: Vec<Vec<u8>>,
+}
+
+/// A stream entry ID, written `<ms>-<seq>`: a Unix time in milliseconds, then a sequence
+/// number that tells apart entries from the same millisecond. IDs sort in that order.
+#[derive(Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+struct StreamId {
+    ms: u64,
+    seq: u64,
+}
+
+impl std::fmt::Display for StreamId {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "{}-{}", self.ms, self.seq)
+    }
 }
 
 #[tokio::main]
@@ -127,7 +149,7 @@ async fn handle_command(request: Value, db: &Db) -> Value {
         b"GET" => match args {
             [key] => match live_value(&mut db.lock().unwrap(), key) {
                 Some(Data::String(value)) => Value::BulkString(value.clone()),
-                Some(Data::List(_)) => wrong_type(),
+                Some(_) => wrong_type(),
                 None => Value::NullBulkString,
             },
             _ => wrong_arity("get"),
@@ -151,7 +173,7 @@ async fn handle_command(request: Value, db: &Db) -> Value {
                 };
                 match live_value(&mut db.lock().unwrap(), key) {
                     Some(Data::List(list)) => Value::Array(list_range(list, start, stop)),
-                    Some(Data::String(_)) => wrong_type(),
+                    Some(_) => wrong_type(),
                     None => Value::Array(vec![]),
                 }
             }
@@ -160,7 +182,7 @@ async fn handle_command(request: Value, db: &Db) -> Value {
         b"LLEN" => match args {
             [key] => match live_value(&mut db.lock().unwrap(), key) {
                 Some(Data::List(list)) => Value::Integer(list.len() as i64),
-                Some(Data::String(_)) => wrong_type(),
+                Some(_) => wrong_type(),
                 None => Value::Integer(0),
             },
             _ => wrong_arity("llen"),
@@ -185,11 +207,18 @@ async fn handle_command(request: Value, db: &Db) -> Value {
                 let kind = match live_value(&mut db.lock().unwrap(), key) {
                     Some(Data::String(_)) => "string",
                     Some(Data::List(_)) => "list",
+                    Some(Data::Stream(_)) => "stream",
                     None => "none",
                 };
                 Value::SimpleString(kind.into())
             }
             _ => wrong_arity("type"),
+        },
+        b"XADD" => match args {
+            [key, id, fields @ ..] if !fields.is_empty() && fields.len().is_multiple_of(2) => {
+                add_to_stream(db, key, id, fields)
+            }
+            _ => wrong_arity("xadd"),
         },
         _ => Value::Error(format!(
             "ERR unknown command '{}'",
@@ -262,6 +291,18 @@ fn live_value<'a>(db: &'a mut Store, key: &[u8]) -> Option<&'a mut Data> {
     db.entries.get_mut(key).map(|entry| &mut entry.value)
 }
 
+/// Like `live_value`, but first stores `new` at `key` if the key is missing or expired.
+fn live_value_or_insert<'a>(db: &'a mut Store, key: &[u8], new: Data) -> &'a mut Data {
+    if db.entries.get(key).is_some_and(Entry::is_expired) {
+        db.entries.remove(key);
+    }
+    let entry = db.entries.entry(key.to_vec()).or_insert(Entry {
+        value: new,
+        expires_at: None,
+    });
+    &mut entry.value
+}
+
 /// Pushes `elements` onto the list at `key` one at a time (so LPUSH a b c gives c b a),
 /// creating the list if needed. Replies with the list's new length.
 fn push_to_list(
@@ -271,15 +312,7 @@ fn push_to_list(
     push: fn(&mut VecDeque<Vec<u8>>, Vec<u8>),
 ) -> Value {
     let mut db = db.lock().unwrap();
-    // An expired key counts as missing, so pushing to it starts a new list.
-    if db.entries.get(key).is_some_and(Entry::is_expired) {
-        db.entries.remove(key);
-    }
-    let entry = db.entries.entry(key.to_vec()).or_insert_with(|| Entry {
-        value: Data::List(VecDeque::new()),
-        expires_at: None,
-    });
-    let Data::List(list) = &mut entry.value else {
+    let Data::List(list) = live_value_or_insert(&mut db, key, Data::List(VecDeque::new())) else {
         return wrong_type();
     };
     for element in elements {
@@ -297,7 +330,7 @@ fn pop_from_list(db: &Db, key: &[u8], count: Option<usize>) -> Value {
     let mut db = db.lock().unwrap();
     let list = match live_value(&mut db, key) {
         Some(Data::List(list)) => list,
-        Some(Data::String(_)) => return wrong_type(),
+        Some(_) => return wrong_type(),
         None if count.is_some() => return Value::NullArray,
         None => return Value::NullBulkString,
     };
@@ -351,7 +384,7 @@ fn serve_blocked(db: &mut Store, key: &[u8]) {
 async fn blocking_pop(db: &Db, key: &[u8], timeout: Option<Duration>) -> Value {
     let mut receiver = {
         let mut db = db.lock().unwrap();
-        if let Some(Data::String(_)) = live_value(&mut db, key) {
+        if !matches!(live_value(&mut db, key), None | Some(Data::List(_))) {
             return wrong_type();
         }
         let (sender, receiver) = oneshot::channel();
@@ -396,6 +429,64 @@ fn list_range(list: &VecDeque<Vec<u8>>, start: i64, stop: i64) -> Vec<Value> {
     list.range(start as usize..=stop as usize)
         .map(|element| Value::BulkString(element.clone()))
         .collect()
+}
+
+/// Appends an entry to the stream at `key`, creating the stream if needed, and replies
+/// with the new entry's ID.
+fn add_to_stream(db: &Db, key: &[u8], id: &[u8], fields: &[Vec<u8>]) -> Value {
+    let Some((ms, seq)) = parse_xadd_id(id) else {
+        return Value::Error("ERR Invalid stream ID specified as stream command argument".into());
+    };
+    // Rejected before the stream is created, so that this can't leave an empty one behind.
+    if (ms, seq) == (Some(0), Some(0)) {
+        return Value::Error("ERR The ID specified in XADD must be greater than 0-0".into());
+    }
+    let mut db = db.lock().unwrap();
+    let Data::Stream(stream) = live_value_or_insert(&mut db, key, Data::Stream(Vec::new())) else {
+        return wrong_type();
+    };
+    // A new stream counts as ending at 0-0, below every ID it can be given.
+    let last = stream.last().map(|entry| entry.id).unwrap_or_default();
+    let ms = ms.unwrap_or_else(|| {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
+        // If the clock has gone backwards, carry on from the last entry's time.
+        (now.as_millis() as u64).max(last.ms)
+    });
+    let seq = match seq {
+        Some(seq) => seq,
+        // Within the same millisecond, carry on from the last entry's sequence number.
+        None if ms == last.ms => last.seq.saturating_add(1),
+        None => 0,
+    };
+    let id = StreamId { ms, seq };
+    if id <= last {
+        return Value::Error(
+            "ERR The ID specified in XADD is equal or smaller than the target stream top item"
+                .into(),
+        );
+    }
+    stream.push(StreamEntry {
+        id,
+        fields: fields.to_vec(),
+    });
+    Value::BulkString(id.to_string().into_bytes())
+}
+
+/// Parses XADD's ID argument into its time and sequence number, with `None` for a part
+/// to generate: `<ms>-<seq>`, `<ms>` (sequence 0), `<ms>-*` or `*`.
+fn parse_xadd_id(arg: &[u8]) -> Option<(Option<u64>, Option<u64>)> {
+    if arg == b"*" {
+        return Some((None, None));
+    }
+    let arg = std::str::from_utf8(arg).ok()?;
+    let (ms, seq) = arg.split_once('-').unwrap_or((arg, "0"));
+    let seq = match seq {
+        "*" => None,
+        seq => Some(seq.parse().ok()?),
+    };
+    Some((Some(ms.parse().ok()?), seq))
 }
 
 /// Clients send each command as an array of bulk strings, e.g. ["ECHO", "hey"].
