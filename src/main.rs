@@ -142,6 +142,14 @@ fn handle_command(request: Value, db: &Db) -> Value {
             },
             _ => wrong_arity("llen"),
         },
+        b"LPOP" => match args {
+            [key] => pop_from_list(db, key, None),
+            [key, count] => match parse_integer(count) {
+                Some(count) => pop_from_list(db, key, Some(count)),
+                None => Value::Error("ERR value is out of range, must be positive".into()),
+            },
+            _ => wrong_arity("lpop"),
+        },
         _ => Value::Error(format!(
             "ERR unknown command '{}'",
             String::from_utf8_lossy(name)
@@ -222,6 +230,32 @@ fn push_to_list(
         }
         Data::String(_) => wrong_type(),
     }
+}
+
+/// Removes elements from the front of the list at `key`: just the first one as a bulk
+/// string, or up to `count` of them as an array.
+fn pop_from_list(db: &Db, key: &[u8], count: Option<usize>) -> Value {
+    let mut db = db.lock().unwrap();
+    let list = match live_value(&mut db, key) {
+        Some(Data::List(list)) => list,
+        Some(Data::String(_)) => return wrong_type(),
+        None if count.is_some() => return Value::NullArray,
+        None => return Value::NullBulkString,
+    };
+    let reply = match count {
+        None => list
+            .pop_front()
+            .map_or(Value::NullBulkString, Value::BulkString),
+        Some(count) => {
+            let count = count.min(list.len());
+            Value::Array(list.drain(..count).map(Value::BulkString).collect())
+        }
+    };
+    // Redis deletes a list along with its last element, so the key reads as missing again.
+    if list.is_empty() {
+        db.remove(key);
+    }
+    reply
 }
 
 /// Returns the elements from `start` to `stop` inclusive. Negative indexes count back
