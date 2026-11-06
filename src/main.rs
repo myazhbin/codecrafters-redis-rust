@@ -1,9 +1,12 @@
 #![allow(unused_imports)]
 
+mod config;
+mod glob;
 mod resp;
 
 use anyhow::{Result, bail};
 use bytes::{Buf, BytesMut};
+use config::Config;
 use resp::Value;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -42,6 +45,8 @@ struct Store {
     /// Where the replication stream ended after the last write, which is as far as a
     /// replica has to get to have all the writes. (The stream also holds GETACKs.)
     write_offset: u64,
+    /// The settings the server started with, for CONFIG GET.
+    config: Config,
 }
 
 impl Store {
@@ -192,57 +197,17 @@ impl std::fmt::Display for StreamId {
     }
 }
 
-/// Settings from the command line.
-struct Config {
-    /// The port to listen on, set with `--port`.
-    port: u16,
-    /// The host and port of the master to replicate, set with `--replicaof`. A server
-    /// without one is a master itself.
-    replicaof: Option<(String, u16)>,
-}
-
-/// Reads the command-line arguments that follow the program's name:
-/// `[--port <port>] [--replicaof "<host> <port>"]`.
-fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Config, String> {
-    let mut config = Config {
-        port: 6379,
-        replicaof: None,
-    };
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--port" => {
-                let port = args.next().ok_or("--port needs a port number")?;
-                config.port = port.parse().map_err(|_| format!("invalid port: {port}"))?;
-            }
-            "--replicaof" => {
-                let master = args.next().ok_or("--replicaof needs a host and port")?;
-                let invalid = format!("invalid master address: {master}");
-                config.replicaof = Some(parse_master(&master).ok_or(invalid)?);
-            }
-            _ => return Err(format!("unknown argument: {arg}")),
-        }
-    }
-    Ok(config)
-}
-
-/// Parses the value of `--replicaof`: a host and a port, with whitespace between them.
-fn parse_master(arg: &str) -> Option<(String, u16)> {
-    let parts: Vec<&str> = arg.split_whitespace().collect();
-    let [host, port] = parts[..] else {
-        return None;
-    };
-    Some((host.to_string(), port.parse().ok()?))
-}
-
 #[tokio::main]
 async fn main() {
-    let config = parse_args(std::env::args().skip(1)).unwrap_or_else(|msg| {
+    let cwd = std::env::current_dir().map_or_else(|_| String::new(), |dir| dir.display().to_string());
+    let config = config::parse_args(std::env::args().skip(1), cwd).unwrap_or_else(|msg| {
         eprintln!("{msg}");
         std::process::exit(1);
     });
     let listener = TcpListener::bind(("127.0.0.1", config.port)).await.unwrap();
     let db = Db::new(Mutex::new(Store {
         is_replica: config.replicaof.is_some(),
+        config: config.clone(),
         ..Store::default()
     }));
 
@@ -743,6 +708,7 @@ fn run_command(db: &mut Store, command: &[Vec<u8>]) -> Value {
             _ => wrong_arity("unwatch"),
         },
         b"INFO" => info(db, args),
+        b"CONFIG" => config_command(&db.config, args),
         // Nothing uses what a replica says about itself in the handshake. The REPLCONFs that
         // do matter, ACK and GETACK, are dealt with on the replication connection.
         b"REPLCONF" => Value::SimpleString("OK".into()),
@@ -1288,6 +1254,34 @@ fn info(db: &Store, sections: &[Vec<u8>]) -> Value {
     Value::BulkString(text.into_bytes())
 }
 
+/// CONFIG, of which only CONFIG GET is supported: the name and value of each parameter
+/// whose name matches one of the patterns given, all in one flat array.
+fn config_command(config: &Config, args: &[Vec<u8>]) -> Value {
+    let Some((subcommand, patterns)) = args.split_first() else {
+        return wrong_arity("config");
+    };
+    if !subcommand.eq_ignore_ascii_case(b"GET") {
+        return Value::Error(format!(
+            "ERR unknown subcommand '{}'. Try CONFIG HELP.",
+            String::from_utf8_lossy(subcommand)
+        ));
+    }
+    if patterns.is_empty() {
+        return wrong_arity("config|get");
+    }
+    let mut reply = Vec::new();
+    for (name, value) in config.params() {
+        if patterns
+            .iter()
+            .any(|pattern| glob::matches(pattern, name.as_bytes(), true))
+        {
+            reply.push(Value::BulkString(name.into()));
+            reply.push(Value::BulkString(value.into_bytes()));
+        }
+    }
+    Value::Array(reply)
+}
+
 /// WAIT outside a transaction: replies with how many replicas have acknowledged all the
 /// writes so far, as soon as that's at least `wanted`, or else after `timeout` (or never,
 /// if there's no timeout).
@@ -1357,62 +1351,4 @@ fn command_args(request: Value) -> Option<Vec<Vec<u8>>> {
             _ => None,
         })
         .collect()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn parse(args: &[&str]) -> Result<Config, String> {
-        parse_args(args.iter().map(|arg| arg.to_string()))
-    }
-
-    #[test]
-    fn port_defaults_to_6379() {
-        assert_eq!(parse(&[]).unwrap().port, 6379);
-    }
-
-    #[test]
-    fn reads_the_port() {
-        assert_eq!(parse(&["--port", "6380"]).unwrap().port, 6380);
-    }
-
-    #[test]
-    fn replicates_nothing_by_default() {
-        assert_eq!(parse(&[]).unwrap().replicaof, None);
-    }
-
-    #[test]
-    fn reads_the_master_to_replicate() {
-        for args in [
-            ["--port", "6380", "--replicaof", "localhost 6379"],
-            ["--replicaof", "localhost 6379", "--port", "6380"],
-        ] {
-            let config = parse(&args).unwrap();
-            assert_eq!(config.port, 6380);
-            assert_eq!(config.replicaof, Some(("localhost".to_string(), 6379)));
-        }
-    }
-
-    #[test]
-    fn rejects_bad_arguments() {
-        let error = |args: &[&str]| parse(args).err().unwrap();
-        assert_eq!(error(&["--port"]), "--port needs a port number");
-        assert_eq!(error(&["--port", "abc"]), "invalid port: abc");
-        assert_eq!(error(&["--port", "70000"]), "invalid port: 70000");
-        assert_eq!(error(&["--bogus"]), "unknown argument: --bogus");
-        assert_eq!(error(&["--replicaof"]), "--replicaof needs a host and port");
-        for master in [
-            "",
-            "localhost",
-            "localhost abc",
-            "localhost 70000",
-            "a b 6379",
-        ] {
-            assert_eq!(
-                error(&["--replicaof", master]),
-                format!("invalid master address: {master}")
-            );
-        }
-    }
 }

@@ -42,6 +42,7 @@ script_tests! {
     replica_commands: "replica_commands.py",
     wait: "wait.py",
     replication: "replication.py",
+    rdb: "rdb.py",
 }
 
 /// Runs tests/<script>, failing if it reports a failure, with the script's output shown.
