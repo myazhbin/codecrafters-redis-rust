@@ -51,6 +51,9 @@ struct Store {
     config: Config,
     /// With `--appendonly yes`, the append-only file that writes are logged to.
     aof: Option<aof::Aof>,
+    /// The clients subscribed to each Pub/Sub channel, by client ID, with where to send
+    /// them the messages published to it.
+    channels: HashMap<Vec<u8>, HashMap<u64, mpsc::UnboundedSender<Vec<u8>>>>,
 }
 
 impl Store {
@@ -467,24 +470,56 @@ struct Session {
     replica: Option<(u64, mpsc::UnboundedReceiver<Vec<u8>>)>,
     /// The Pub/Sub channels the client is subscribed to, in the order it subscribed.
     subscriptions: Vec<Vec<u8>>,
+    /// Where messages published to those channels arrive, once the client has subscribed.
+    inbox: Option<Inbox>,
 }
 
-async fn handle_connection(mut stream: TcpStream, db: Db) -> Result<()> {
-    let mut buf = BytesMut::with_capacity(512);
+/// Where the messages published to a client's channels arrive, ready to send it.
+struct Inbox {
+    /// Tells the client apart from other subscribers to a channel.
+    id: u64,
+    sender: mpsc::UnboundedSender<Vec<u8>>,
+    receiver: mpsc::UnboundedReceiver<Vec<u8>>,
+}
+
+impl Inbox {
+    fn new() -> Self {
+        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let (sender, receiver) = mpsc::unbounded_channel();
+        Inbox {
+            id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            sender,
+            receiver,
+        }
+    }
+}
+
+async fn handle_connection(stream: TcpStream, db: Db) -> Result<()> {
     let mut session = Session::default();
+    let result = serve_client(stream, &db, &mut session).await;
+    // A client that hangs up is no longer subscribed to anything.
+    let mut db = db.lock().unwrap();
+    for channel in std::mem::take(&mut session.subscriptions) {
+        unsubscribe(&mut db, &channel, &session);
+    }
+    result
+}
+
+async fn serve_client(mut stream: TcpStream, db: &Db, session: &mut Session) -> Result<()> {
+    let mut buf = BytesMut::with_capacity(512);
     loop {
         // A read can end partway through a command or hold several pipelined ones,
         // so answer every complete command buffered so far, then read more.
         while let Some((request, len)) = Value::parse(&buf)? {
             buf.advance(len);
-            if let Some(replies) = pubsub_command(&request, &mut session) {
+            if let Some(replies) = pubsub_command(&request, db, session) {
                 for reply in replies {
                     stream.write_all(&reply.encode()).await?;
                 }
                 continue;
             }
             let reply = {
-                let command = handle_request(request, &db, &mut session);
+                let command = handle_request(request, db, session);
                 tokio::pin!(command);
                 // Some commands can wait indefinitely, so keep reading meanwhile. If the
                 // client hangs up, the wait is dropped rather than later taking an element
@@ -505,7 +540,7 @@ async fn handle_connection(mut stream: TcpStream, db: Db) -> Result<()> {
             stream.write_all(&reply.encode()).await?;
             // PSYNC has made this a replication connection, for good.
             if let Some((id, replication_stream)) = session.replica.take() {
-                return serve_replica(stream, &db, id, replication_stream).await;
+                return serve_replica(stream, db, id, replication_stream).await;
             }
         }
 
@@ -519,7 +554,7 @@ async fn handle_connection(mut stream: TcpStream, db: Db) -> Result<()> {
 /// once (SUBSCRIBE replies once for each channel), and refuses the commands that aren't
 /// allowed in subscribed mode. Returns `None` for any other command, which
 /// `handle_request` deals with.
-fn pubsub_command(request: &Value, session: &mut Session) -> Option<Vec<Value>> {
+fn pubsub_command(request: &Value, db: &Db, session: &mut Session) -> Option<Vec<Value>> {
     let Value::Array(items) = request else {
         return None;
     };
@@ -568,14 +603,53 @@ fn pubsub_command(request: &Value, session: &mut Session) -> Option<Vec<Value>> 
     if channels.is_empty() {
         return Some(vec![wrong_arity("subscribe")]);
     }
-    let replies = channels.iter().map(|&channel| {
+    let mut db = db.lock().unwrap();
+    let inbox = session.inbox.get_or_insert_with(Inbox::new);
+    let mut replies = Vec::new();
+    for &channel in channels {
         // Subscribing to a channel again changes nothing.
         if !session.subscriptions.iter().any(|c| c == channel) {
             session.subscriptions.push(channel.to_vec());
+            let subscribers = db.channels.entry(channel.to_vec()).or_default();
+            subscribers.insert(inbox.id, inbox.sender.clone());
         }
-        subscription_reply("subscribe", Some(channel), session.subscriptions.len())
-    });
-    Some(replies.collect())
+        replies.push(subscription_reply("subscribe", Some(channel), session.subscriptions.len()));
+    }
+    Some(replies)
+}
+
+/// Takes the client out of the channel's subscribers.
+fn unsubscribe(db: &mut Store, channel: &[u8], session: &Session) {
+    let Some(inbox) = &session.inbox else {
+        return;
+    };
+    if let Some(subscribers) = db.channels.get_mut(channel) {
+        subscribers.remove(&inbox.id);
+        if subscribers.is_empty() {
+            db.channels.remove(channel);
+        }
+    }
+}
+
+/// PUBLISH: sends `message` to every client subscribed to `channel`, and replies with how
+/// many there were.
+fn publish(db: &mut Store, channel: &[u8], message: &[u8]) -> Value {
+    let Some(subscribers) = db.channels.get_mut(channel) else {
+        return Value::Integer(0);
+    };
+    let delivery = Value::Array(vec![
+        Value::BulkString(b"message".to_vec()),
+        Value::BulkString(channel.to_vec()),
+        Value::BulkString(message.to_vec()),
+    ])
+    .encode();
+    // A client whose connection has just closed is forgotten rather than counted.
+    subscribers.retain(|_, inbox| inbox.send(delivery.clone()).is_ok());
+    let count = subscribers.len();
+    if subscribers.is_empty() {
+        db.channels.remove(channel);
+    }
+    Value::Integer(count as i64)
 }
 
 /// The reply to subscribing to a channel or unsubscribing from one: what happened, the
@@ -919,6 +993,10 @@ fn run_command(db: &mut Store, command: &[Vec<u8>]) -> Value {
             }
             [_] => Value::Error("ERR value is not an integer or out of range".into()),
             _ => wrong_arity("select"),
+        },
+        b"PUBLISH" => match args {
+            [channel, message] => publish(db, channel, message),
+            _ => wrong_arity("publish"),
         },
         b"KEYS" => match args {
             [pattern] => matching_keys(db, pattern),

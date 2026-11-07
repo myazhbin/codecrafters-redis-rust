@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Pub/Sub, from the "Subscribe to a channel" stage on, using several clients."""
 
+import time
+
 from helpers import OK, Client, bulk, command, finish, run, running_server
 
 
@@ -52,6 +54,27 @@ with running_server():
     command(b"+PONG\r\n", "PING")
     command(bulk("hello"), "PING", "hello")
     command(b"-ERR wrong number of arguments for 'ping' command\r\n", "PING", "a", "b")
+
+    print("== stage test: PUBLISH replies with how many clients are subscribed")
+    news, sport1, sport2 = Client(), Client(), Client()
+    run(news, subscribed("news", 1), "SUBSCRIBE", "news")
+    run(sport1, subscribed("sport", 1), "SUBSCRIBE", "sport")
+    run(sport2, subscribed("sport", 1), "SUBSCRIBE", "sport")
+    command(b":2\r\n", "PUBLISH", "sport", "msg")
+    command(b":1\r\n", "PUBLISH", "news", "msg")
+    command(b":0\r\n", "PUBLISH", "nobody-listens", "msg")
+
+    print("== a client that hangs up stops counting")
+    sport2.close()
+    time.sleep(0.2)
+    command(b":1\r\n", "PUBLISH", "sport", "msg")
+
+    print("== PUBLISH's arity, and inside a transaction")
+    command(b"-ERR wrong number of arguments for 'publish' command\r\n", "PUBLISH", "news")
+    publisher = Client()
+    run(publisher, OK, "MULTI")
+    run(publisher, b"+QUEUED\r\n", "PUBLISH", "news", "msg")
+    run(publisher, b"*1\r\n:1\r\n", "EXEC")
 
     print("== arity, lowercase, and not inside a transaction")
     command(b"-ERR wrong number of arguments for 'subscribe' command\r\n", "SUBSCRIBE")
