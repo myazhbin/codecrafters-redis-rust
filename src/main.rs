@@ -1051,6 +1051,34 @@ fn run_command(db: &mut Store, command: &[Vec<u8>]) -> Value {
             [key, pairs @ ..] if pairs.len() >= 2 => zadd(db, key, pairs),
             _ => wrong_arity("zadd"),
         },
+        b"ZRANGE" => match args {
+            [key, start, stop, options @ ..] => {
+                let with_scores = match options {
+                    [] => false,
+                    [option] if option.eq_ignore_ascii_case(b"WITHSCORES") => true,
+                    _ => return Value::Error("ERR syntax error".into()),
+                };
+                let (Some(start), Some(stop)) = (parse_number(start), parse_number(stop)) else {
+                    return Value::Error("ERR value is not an integer or out of range".into());
+                };
+                match live_value(db, key) {
+                    Some(Data::SortedSet(set)) => {
+                        let mut reply = Vec::new();
+                        for (score, member) in set.range(start, stop) {
+                            reply.push(Value::BulkString(member.clone()));
+                            if with_scores {
+                                let score = zset::format_score(*score);
+                                reply.push(Value::BulkString(score.into_bytes()));
+                            }
+                        }
+                        Value::Array(reply)
+                    }
+                    Some(_) => wrong_type(),
+                    None => Value::Array(vec![]),
+                }
+            }
+            _ => wrong_arity("zrange"),
+        },
         b"ZRANK" => match args {
             [key, member] => match live_value(db, key) {
                 Some(Data::SortedSet(set)) => set

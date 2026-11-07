@@ -52,6 +52,28 @@ check '+OK\r\n' SET a-string v
 check "$wrongtype" ZRANK a-string member
 check "-ERR wrong number of arguments for 'zrank' command\\r\\n" ZRANK ranked
 
+echo "== stage test: ZRANGE lists members from one rank to another"
+check ':1\r\n' ZADD listed 100.0 foo
+check ':1\r\n' ZADD listed 100.0 bar
+check ':1\r\n' ZADD listed 20.0 baz
+check ':1\r\n' ZADD listed 30.1 caz
+check ':1\r\n' ZADD listed 40.2 paz
+check "$(array paz bar foo)" ZRANGE listed 2 4
+check "$(array baz caz paz bar foo)" ZRANGE listed 0 4
+check "$(array baz)" ZRANGE listed 0 0
+check "$(array bar foo)" ZRANGE listed 3 100
+check '*0\r\n' ZRANGE listed 5 10
+check '*0\r\n' ZRANGE listed 3 1
+check '*0\r\n' ZRANGE missing 0 10
+
+echo "== ZRANGE WITHSCORES, errors"
+check "$(array baz 20 caz 30.1)" ZRANGE listed 0 1 WITHSCORES
+check "$(array paz 40.2)" ZRANGE listed 2 2 withscores
+check '-ERR syntax error\r\n' ZRANGE listed 0 1 BOGUS
+check '-ERR value is not an integer or out of range\r\n' ZRANGE listed a 1
+check "$wrongtype" ZRANGE a-string 0 1
+check "-ERR wrong number of arguments for 'zrange' command\\r\\n" ZRANGE listed 0
+
 echo "== errors, which leave nothing behind"
 check '-ERR value is not a valid float\r\n' ZADD added 1 new3 x new4
 check '-ERR value is not a valid float\r\n' ZADD bad abc member
