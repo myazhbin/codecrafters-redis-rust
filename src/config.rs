@@ -36,6 +36,15 @@ pub enum Fsync {
 }
 
 impl Fsync {
+    fn parse(name: &str) -> Option<Self> {
+        match name.to_ascii_lowercase().as_str() {
+            "always" => Some(Fsync::Always),
+            "everysec" => Some(Fsync::Everysec),
+            "no" => Some(Fsync::No),
+            _ => None,
+        }
+    }
+
     pub fn name(self) -> &'static str {
         match self {
             Fsync::Always => "always",
@@ -75,9 +84,11 @@ impl Config {
     }
 }
 
-/// Reads the command-line arguments that follow the program's name:
-/// `[--port <port>] [--replicaof "<host> <port>"] [--dir <dir>] [--dbfilename <name>]`.
-/// `cwd` is the working directory, which `--dir` defaults to.
+/// Reads the command-line arguments that follow the program's name: `--port <port>`,
+/// `--replicaof "<host> <port>"`, `--dir <dir>`, `--dbfilename <name>`,
+/// `--appendonly yes|no`, `--appenddirname <name>`, `--appendfilename <name>` and
+/// `--appendfsync always|everysec|no`, all optional and in any order. `cwd` is the working
+/// directory, which `--dir` defaults to.
 pub fn parse_args(mut args: impl Iterator<Item = String>, cwd: String) -> Result<Config, String> {
     let mut config = Config {
         dir: cwd,
@@ -97,6 +108,26 @@ pub fn parse_args(mut args: impl Iterator<Item = String>, cwd: String) -> Result
             "--dir" => config.dir = args.next().ok_or("--dir needs a directory")?,
             "--dbfilename" => {
                 config.dbfilename = args.next().ok_or("--dbfilename needs a file name")?;
+            }
+            "--appendonly" => {
+                let value = args.next().ok_or("--appendonly needs yes or no")?;
+                config.appendonly = match value.to_ascii_lowercase().as_str() {
+                    "yes" => true,
+                    "no" => false,
+                    _ => return Err(format!("invalid --appendonly (yes or no): {value}")),
+                };
+            }
+            "--appenddirname" => {
+                config.appenddirname = args.next().ok_or("--appenddirname needs a name")?;
+            }
+            "--appendfilename" => {
+                config.appendfilename = args.next().ok_or("--appendfilename needs a name")?;
+            }
+            "--appendfsync" => {
+                let value = args.next().ok_or("--appendfsync needs always, everysec or no")?;
+                config.appendfsync = Fsync::parse(&value).ok_or_else(|| {
+                    format!("invalid --appendfsync (always, everysec or no): {value}")
+                })?;
             }
             _ => return Err(format!("unknown argument: {arg}")),
         }
@@ -170,6 +201,28 @@ mod tests {
     }
 
     #[test]
+    fn reads_the_aof_settings() {
+        let config = parse(&[
+            "--dir", "/data", "--appendonly", "yes", "--appenddirname", "aofdir",
+            "--appendfilename", "log.aof", "--appendfsync", "always",
+        ])
+        .unwrap();
+        assert_eq!(config.dir, "/data");
+        assert!(config.appendonly);
+        assert_eq!(config.appenddirname, "aofdir");
+        assert_eq!(config.appendfilename, "log.aof");
+        assert_eq!(config.appendfsync, Fsync::Always);
+        // Flags that are left out keep their defaults.
+        let config = parse(&["--appendonly", "no", "--appendfsync", "no"]).unwrap();
+        assert!(!config.appendonly);
+        assert_eq!(config.appendfsync, Fsync::No);
+        assert_eq!(config.appendfilename, "appendonly.aof");
+        let config = parse(&["--appendonly", "YES", "--appendfsync", "EverySec"]).unwrap();
+        assert!(config.appendonly);
+        assert_eq!(config.appendfsync, Fsync::Everysec);
+    }
+
+    #[test]
     fn reads_the_rdb_file_location() {
         let config = parse(&["--dir", "/tmp/redis-files", "--dbfilename", "dump.rdb"]).unwrap();
         assert_eq!(config.dir, "/tmp/redis-files");
@@ -189,6 +242,15 @@ mod tests {
         assert_eq!(error(&["--replicaof"]), "--replicaof needs a host and port");
         assert_eq!(error(&["--dir"]), "--dir needs a directory");
         assert_eq!(error(&["--dbfilename"]), "--dbfilename needs a file name");
+        assert_eq!(error(&["--appendonly"]), "--appendonly needs yes or no");
+        assert_eq!(error(&["--appendonly", "maybe"]), "invalid --appendonly (yes or no): maybe");
+        assert_eq!(error(&["--appenddirname"]), "--appenddirname needs a name");
+        assert_eq!(error(&["--appendfilename"]), "--appendfilename needs a name");
+        assert_eq!(error(&["--appendfsync"]), "--appendfsync needs always, everysec or no");
+        assert_eq!(
+            error(&["--appendfsync", "sometimes"]),
+            "invalid --appendfsync (always, everysec or no): sometimes"
+        );
         for master in [
             "",
             "localhost",
