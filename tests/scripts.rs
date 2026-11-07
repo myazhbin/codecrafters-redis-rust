@@ -45,6 +45,7 @@ script_tests! {
     rdb: "rdb.py",
     aof: "aof.py",
     del: "del.sh",
+    pubsub: "pubsub.py",
 }
 
 /// Runs tests/<script>, failing if it reports a failure, with the script's output shown.

@@ -465,6 +465,8 @@ struct Session {
     /// Set by PSYNC, which makes the client a replica: its ID, and where its replication
     /// stream arrives.
     replica: Option<(u64, mpsc::UnboundedReceiver<Vec<u8>>)>,
+    /// The Pub/Sub channels the client is subscribed to, in the order it subscribed.
+    subscriptions: Vec<Vec<u8>>,
 }
 
 async fn handle_connection(mut stream: TcpStream, db: Db) -> Result<()> {
@@ -475,6 +477,12 @@ async fn handle_connection(mut stream: TcpStream, db: Db) -> Result<()> {
         // so answer every complete command buffered so far, then read more.
         while let Some((request, len)) = Value::parse(&buf)? {
             buf.advance(len);
+            if let Some(replies) = pubsub_command(&request, &mut session) {
+                for reply in replies {
+                    stream.write_all(&reply.encode()).await?;
+                }
+                continue;
+            }
             let reply = {
                 let command = handle_request(request, &db, &mut session);
                 tokio::pin!(command);
@@ -505,6 +513,52 @@ async fn handle_connection(mut stream: TcpStream, db: Db) -> Result<()> {
             return Ok(());
         }
     }
+}
+
+/// Handles the Pub/Sub commands that need the client's session and can reply more than
+/// once: SUBSCRIBE replies once for each channel. Returns `None` for any other command,
+/// which `handle_request` deals with.
+fn pubsub_command(request: &Value, session: &mut Session) -> Option<Vec<Value>> {
+    let Value::Array(items) = request else {
+        return None;
+    };
+    let args: Vec<&[u8]> = items
+        .iter()
+        .map(|item| match item {
+            Value::BulkString(arg) => Some(arg.as_slice()),
+            _ => None,
+        })
+        .collect::<Option<_>>()?;
+    let (name, channels) = args.split_first()?;
+    if !name.eq_ignore_ascii_case(b"SUBSCRIBE") {
+        return None;
+    }
+    if session.transaction.is_some() {
+        return Some(vec![Value::Error(
+            "ERR Command not allowed inside a transaction".into(),
+        )]);
+    }
+    if channels.is_empty() {
+        return Some(vec![wrong_arity("subscribe")]);
+    }
+    let replies = channels.iter().map(|&channel| {
+        // Subscribing to a channel again changes nothing.
+        if !session.subscriptions.iter().any(|c| c == channel) {
+            session.subscriptions.push(channel.to_vec());
+        }
+        subscription_reply("subscribe", Some(channel), session.subscriptions.len())
+    });
+    Some(replies.collect())
+}
+
+/// The reply to subscribing to a channel or unsubscribing from one: what happened, the
+/// channel, and how many channels the client is subscribed to now.
+fn subscription_reply(kind: &str, channel: Option<&[u8]>, count: usize) -> Value {
+    Value::Array(vec![
+        Value::BulkString(kind.as_bytes().to_vec()),
+        channel.map_or(Value::NullBulkString, |channel| Value::BulkString(channel.to_vec())),
+        Value::Integer(count as i64),
+    ])
 }
 
 /// An empty RDB file: a header, some metadata, an end-of-file marker and a checksum.
