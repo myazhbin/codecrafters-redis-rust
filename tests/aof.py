@@ -25,6 +25,16 @@ def config(name, value):
     command(encode(name, value), "CONFIG", "GET", name)
 
 
+def file_is(path, want, label):
+    """Checks that the file at `path` holds exactly `want`."""
+    try:
+        with open(path, "rb") as f:
+            got = f.read()
+    except OSError as e:
+        got = e
+    check(label, got == want, f"want {want!r}, got {got!r}")
+
+
 print("== stage test: the AOF settings' defaults")
 with running_server():
     config("dir", os.getcwd())
@@ -82,6 +92,35 @@ with tempfile.TemporaryDirectory() as tmp:
                         "--appendfilename", "log.aof"):
         path = os.path.join(tmp, "other", "log.aof.1.incr.aof")
         check("other/log.aof.1.incr.aof is created", os.path.isfile(path))
+        file_is(os.path.join(tmp, "other", "log.aof.manifest"),
+                b"file log.aof.1.incr.aof seq 1 type i\n", "so is other/log.aof.manifest")
+
+with tempfile.TemporaryDirectory() as tmp:
+    aof_dir = os.path.join(tmp, "appendonlydir")
+    aof_args = ("--dir", tmp, "--appendonly", "yes", "--appenddirname", "appendonlydir",
+                "--appendfilename", "appendonly.aof")
+    manifest = os.path.join(aof_dir, "appendonly.aof.manifest")
+
+    print("== stage test: a manifest listing the incremental file is created at startup")
+    with running_server(*aof_args):
+        check("the AOF file exists", os.path.isfile(os.path.join(aof_dir, "appendonly.aof.1.incr.aof")))
+        file_is(manifest, b"file appendonly.aof.1.incr.aof seq 1 type i\n", "the manifest lists it")
+
+    print("== a manifest that's already there is kept as it is, with the file it lists")
+    custom = b"file custom.1.incr.aof seq 1 type i\n"
+    with open(manifest, "wb") as f:
+        f.write(custom)
+    with running_server(*aof_args):
+        file_is(manifest, custom, "the manifest is unchanged")
+        check("the file it lists is created", os.path.isfile(os.path.join(aof_dir, "custom.1.incr.aof")))
+
+    print("== the server exits with a message if the manifest makes no sense")
+    with open(manifest, "wb") as f:
+        f.write(b"file custom.1.incr.aof seq 1\n")
+    result = subprocess.run([BINARY, "--port", str(OTHER_PORT), *aof_args],
+                            capture_output=True, text=True, timeout=5)
+    check("it exits with status 1", result.returncode == 1, f"status {result.returncode}")
+    check("and says why", "couldn't read the manifest" in result.stderr, f"stderr: {result.stderr!r}")
 
     print("== the server exits with a message if it can't create the directory")
     blocker = os.path.join(tmp, "a-file")
