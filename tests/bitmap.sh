@@ -60,6 +60,38 @@ check ':1\r\n' RPUSH a-list x
 check "$wrongtype" STRLEN a-list
 check "-ERR wrong number of arguments for 'strlen' command\\r\\n" STRLEN
 
+echo "== stage test: BITCOUNT counts the set bits, in all or some of the bytes"
+check ':0\r\n' SETBIT count_key 1 1
+check ':0\r\n' SETBIT count_key 10 1
+check ':2\r\n' BITCOUNT count_key
+check ':2\r\n' BITCOUNT count_key 0 1
+check ':1\r\n' BITCOUNT count_key 0 0
+check ':1\r\n' BITCOUNT count_key 1 1
+check ':0\r\n' BITCOUNT count_key 2 5
+check ':1\r\n' BITCOUNT count_key 1 100
+check ':0\r\n' BITCOUNT count_key 1 0
+check ':0\r\n' BITCOUNT missing
+check ':0\r\n' BITCOUNT missing 0 10
+
+echo "== Redis's own examples, negative indexes, and BYTE and BIT"
+check '+OK\r\n' SET mykey foobar
+check ':26\r\n' BITCOUNT mykey
+check ':4\r\n' BITCOUNT mykey 0 0
+check ':6\r\n' BITCOUNT mykey 1 1
+check ':6\r\n' BITCOUNT mykey 1 1 BYTE
+check ':17\r\n' BITCOUNT mykey 5 30 BIT
+check ':26\r\n' BITCOUNT mykey 0 -1
+check ':4\r\n' BITCOUNT mykey -1 -1
+
+echo "== BITCOUNT errors"
+check '-ERR syntax error\r\n' BITCOUNT mykey 0
+check '-ERR syntax error\r\n' BITCOUNT mykey 0 1 WORDS
+check '-ERR syntax error\r\n' BITCOUNT mykey 0 1 BIT extra
+check '-ERR value is not an integer or out of range\r\n' BITCOUNT mykey a 1
+check ':1\r\n' RPUSH count-list x
+check "$wrongtype" BITCOUNT count-list
+check "-ERR wrong number of arguments for 'bitcount' command\\r\\n" BITCOUNT
+
 echo "== SETBIT changes a string set with SET, keeping its expiry"
 check '+OK\r\n' SET ttl A PX 300
 check ':0\r\n' SETBIT ttl 6 1

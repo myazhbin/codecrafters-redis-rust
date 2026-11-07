@@ -1074,6 +1074,38 @@ fn run_command(db: &mut Store, command: &[Vec<u8>]) -> Value {
             },
             _ => wrong_arity("strlen"),
         },
+        b"BITCOUNT" => match args {
+            [key, range @ ..] if range.len() <= 3 => {
+                // With no range, the whole string; otherwise bytes, or bits with BIT.
+                let count: fn(&[u8], i64, i64) -> u64 = match range {
+                    [_, _, mode] if mode.eq_ignore_ascii_case(b"BIT") => bitmap::count_in_bits,
+                    [_, _, mode] if !mode.eq_ignore_ascii_case(b"BYTE") => {
+                        return Value::Error("ERR syntax error".into());
+                    }
+                    [_] => return Value::Error("ERR syntax error".into()),
+                    _ => bitmap::count_in_bytes,
+                };
+                let (start, end) = match range {
+                    [] => (0, -1),
+                    [start, end, ..] => match (parse_number(start), parse_number(end)) {
+                        (Some(start), Some(end)) => (start, end),
+                        _ => {
+                            return Value::Error(
+                                "ERR value is not an integer or out of range".into(),
+                            );
+                        }
+                    },
+                    _ => unreachable!(),
+                };
+                match live_value(db, key) {
+                    Some(Data::String(bytes)) => Value::Integer(count(bytes, start, end) as i64),
+                    Some(_) => wrong_type(),
+                    None => Value::Integer(0),
+                }
+            }
+            [_, ..] => Value::Error("ERR syntax error".into()),
+            _ => wrong_arity("bitcount"),
+        },
         b"GETBIT" => match args {
             [key, offset] => {
                 let Some(offset) = bitmap::parse_offset(offset) else {
