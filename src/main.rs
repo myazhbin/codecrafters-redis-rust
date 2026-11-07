@@ -1079,6 +1079,16 @@ fn run_command(db: &mut Store, command: &[Vec<u8>]) -> Value {
             }
             _ => wrong_arity("zrange"),
         },
+        b"ZSCORE" => match args {
+            [key, member] => match live_value(db, key) {
+                Some(Data::SortedSet(set)) => set.score(member).map_or(Value::NullBulkString, |score| {
+                    Value::BulkString(zset::format_score(score).into_bytes())
+                }),
+                Some(_) => wrong_type(),
+                None => Value::NullBulkString,
+            },
+            _ => wrong_arity("zscore"),
+        },
         b"ZCARD" => match args {
             [key] => match live_value(db, key) {
                 Some(Data::SortedSet(set)) => Value::Integer(set.len() as i64),

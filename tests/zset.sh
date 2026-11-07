@@ -106,6 +106,28 @@ check ':0\r\n' ZCARD missing_key
 check "$wrongtype" ZCARD a-string
 check "-ERR wrong number of arguments for 'zcard' command\\r\\n" ZCARD
 
+echo "== stage test: ZSCORE gives a member's score"
+check ':1\r\n' ZADD scored 20.0 zset_member1
+check ':1\r\n' ZADD scored 30.1 zset_member2
+check ':1\r\n' ZADD scored 40.2 zset_member3
+check ':1\r\n' ZADD scored 50.3 zset_member4
+check '$4\r\n30.1\r\n' ZSCORE scored zset_member2
+check ':0\r\n' ZADD scored 100.99 zset_member2
+check '$6\r\n100.99\r\n' ZSCORE scored zset_member2
+check '$-1\r\n' ZSCORE scored zset_member100
+check '$-1\r\n' ZSCORE missing_key member
+
+echo "== scores are written as Redis writes them"
+check ':5\r\n' ZADD scored 24.34 one 3663832614298053 geo inf top -2.5 negative 1e30 big
+check '$5\r\n24.34\r\n' ZSCORE scored one
+check '$2\r\n20\r\n' ZSCORE scored zset_member1
+check '$16\r\n3663832614298053\r\n' ZSCORE scored geo
+check '$3\r\ninf\r\n' ZSCORE scored top
+check '$4\r\n-2.5\r\n' ZSCORE scored negative
+check '$5\r\n1e+30\r\n' ZSCORE scored big
+check "$wrongtype" ZSCORE a-string member
+check "-ERR wrong number of arguments for 'zscore' command\\r\\n" ZSCORE scored
+
 echo "== errors, which leave nothing behind"
 check '-ERR value is not a valid float\r\n' ZADD added 1 new3 x new4
 check '-ERR value is not a valid float\r\n' ZADD bad abc member
