@@ -43,6 +43,16 @@ with running_server():
     command(OK, "SET", "key", "value")
     command(b"$5\r\nvalue\r\n", "GET", "key")
 
+    print("== stage test: PING in subscribed mode replies with an array")
+    run(first, b"*2\r\n" + bulk("pong") + bulk(""), "PING")
+    run(first, b"*2\r\n" + bulk("pong") + bulk("hello"), "PING", "hello")
+    run(first, b"-ERR wrong number of arguments for 'ping' command\r\n", "PING", "a", "b")
+
+    print("== and as usual otherwise")
+    command(b"+PONG\r\n", "PING")
+    command(bulk("hello"), "PING", "hello")
+    command(b"-ERR wrong number of arguments for 'ping' command\r\n", "PING", "a", "b")
+
     print("== arity, lowercase, and not inside a transaction")
     command(b"-ERR wrong number of arguments for 'subscribe' command\r\n", "SUBSCRIBE")
     command(subscribed("x", 1), "subscribe", "x")

@@ -545,6 +545,18 @@ fn pubsub_command(request: &Value, session: &mut Session) -> Option<Vec<Value>> 
              / RESET are allowed in this context"
         ))]);
     }
+    // In subscribed mode, PING replies the way a message arrives, as an array.
+    if name == b"PING" && !session.subscriptions.is_empty() {
+        let reply = match channels {
+            [] => Value::Array(vec![Value::BulkString(b"pong".to_vec()), Value::BulkString(vec![])]),
+            [message] => Value::Array(vec![
+                Value::BulkString(b"pong".to_vec()),
+                Value::BulkString(message.to_vec()),
+            ]),
+            _ => wrong_arity("ping"),
+        };
+        return Some(vec![reply]);
+    }
     if name != b"SUBSCRIBE" {
         return None;
     }
@@ -770,7 +782,11 @@ fn run_command(db: &mut Store, command: &[Vec<u8>]) -> Value {
     };
 
     match name.to_ascii_uppercase().as_slice() {
-        b"PING" => Value::SimpleString("PONG".into()),
+        b"PING" => match args {
+            [] => Value::SimpleString("PONG".into()),
+            [message] => Value::BulkString(message.clone()),
+            _ => wrong_arity("ping"),
+        },
         b"ECHO" => match args {
             [message] => Value::BulkString(message.clone()),
             _ => wrong_arity("echo"),
