@@ -544,8 +544,21 @@ async fn serve_client(mut stream: TcpStream, db: &Db, session: &mut Session) -> 
             }
         }
 
-        if stream.read_buf(&mut buf).await? == 0 {
-            return Ok(());
+        // Wait for more from the client, meanwhile sending it any messages published to
+        // the channels it's subscribed to.
+        let message = async {
+            match session.inbox.as_mut() {
+                Some(inbox) => inbox.receiver.recv().await,
+                None => std::future::pending().await,
+            }
+        };
+        tokio::select! {
+            read = stream.read_buf(&mut buf) => {
+                if read? == 0 {
+                    return Ok(());
+                }
+            }
+            Some(message) = message => stream.write_all(&message).await?,
         }
     }
 }

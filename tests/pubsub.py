@@ -3,12 +3,18 @@
 
 import time
 
-from helpers import OK, Client, bulk, command, finish, run, running_server
+from helpers import (OK, Client, bulk, command, expect, expect_nothing, finish, run,
+                     running_server)
 
 
 def subscribed(channel, count):
     """The reply to subscribing to `channel`, leaving the client subscribed to `count`."""
     return b"*3\r\n" + bulk("subscribe") + bulk(channel) + b":%d\r\n" % count
+
+
+def message(channel, text):
+    """What a subscriber receives when `text` is published to `channel`."""
+    return b"*3\r\n" + bulk("message") + bulk(channel) + bulk(text)
 
 
 with running_server():
@@ -68,6 +74,34 @@ with running_server():
     sport2.close()
     time.sleep(0.2)
     command(b":1\r\n", "PUBLISH", "sport", "msg")
+
+    print("== stage test: subscribers get each message published to their channels")
+    a1, a2, b1, idle = Client(), Client(), Client(), Client()
+    run(a1, subscribed("chan-a", 1), "SUBSCRIBE", "chan-a")
+    run(a2, subscribed("chan-a", 1), "SUBSCRIBE", "chan-a")
+    run(b1, subscribed("chan-b", 1), "SUBSCRIBE", "chan-b")
+    command(b":2\r\n", "PUBLISH", "chan-a", "hello")
+    command(b":1\r\n", "PUBLISH", "chan-b", "world")
+    expect(a1, message("chan-a", "hello"), "the first chan-a subscriber gets hello")
+    expect(a2, message("chan-a", "hello"), "so does the second")
+    expect(b1, message("chan-b", "world"), "the chan-b subscriber gets world")
+    expect_nothing(a1, "chan-a's subscribers don't get chan-b's message")
+    expect_nothing(idle, "a client that isn't subscribed gets nothing")
+
+    print("== messages arrive in order, from any channel the client is subscribed to")
+    run(a1, subscribed("chan-b", 2), "SUBSCRIBE", "chan-b")
+    command(b":2\r\n", "PUBLISH", "chan-a", "one")
+    command(b":2\r\n", "PUBLISH", "chan-b", "two")
+    command(b":2\r\n", "PUBLISH", "chan-a", "three")
+    expect(a1, message("chan-a", "one") + message("chan-b", "two") + message("chan-a", "three"),
+           "the client subscribed to both channels gets all three")
+    expect(a2, message("chan-a", "one") + message("chan-a", "three"), "chan-a's other subscriber gets two")
+    expect(b1, message("chan-b", "two"), "chan-b's other subscriber gets one")
+
+    print("== a subscriber can still PING between messages")
+    run(a2, b"*2\r\n" + bulk("pong") + bulk(""), "PING")
+    command(b":2\r\n", "PUBLISH", "chan-a", "after ping")
+    expect(a2, message("chan-a", "after ping"), "the message after the PING")
 
     print("== PUBLISH's arity, and inside a transaction")
     command(b"-ERR wrong number of arguments for 'publish' command\r\n", "PUBLISH", "news")
