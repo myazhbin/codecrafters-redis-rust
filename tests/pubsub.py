@@ -12,6 +12,11 @@ def subscribed(channel, count):
     return b"*3\r\n" + bulk("subscribe") + bulk(channel) + b":%d\r\n" % count
 
 
+def unsubscribed(channel, count):
+    """The reply to unsubscribing from `channel`, leaving the client subscribed to `count`."""
+    return b"*3\r\n" + bulk("unsubscribe") + bulk(channel) + b":%d\r\n" % count
+
+
 def message(channel, text):
     """What a subscriber receives when `text` is published to `channel`."""
     return b"*3\r\n" + bulk("message") + bulk(channel) + bulk(text)
@@ -102,6 +107,43 @@ with running_server():
     run(a2, b"*2\r\n" + bulk("pong") + bulk(""), "PING")
     command(b":2\r\n", "PUBLISH", "chan-a", "after ping")
     expect(a2, message("chan-a", "after ping"), "the message after the PING")
+
+    print("== stage test: UNSUBSCRIBE, with messages before and after")
+    one, two = Client(), Client()
+    run(one, subscribed("u-foo", 1) + subscribed("u-baz", 2), "SUBSCRIBE", "u-foo", "u-baz")
+    run(two, subscribed("u-foo", 1) + subscribed("u-bar", 2), "SUBSCRIBE", "u-foo", "u-bar")
+    command(b":2\r\n", "PUBLISH", "u-foo", "before-unsubscribe")
+    expect(one, message("u-foo", "before-unsubscribe"), "client one gets the first message")
+    expect(two, message("u-foo", "before-unsubscribe"), "so does client two")
+    run(one, unsubscribed("u-foo", 1), "UNSUBSCRIBE", "u-foo")
+    command(b":1\r\n", "PUBLISH", "u-foo", "after-unsubscribe")
+    expect(two, message("u-foo", "after-unsubscribe"), "client two gets the second message")
+    expect_nothing(one, "client one doesn't")
+    command(b":1\r\n", "PUBLISH", "u-baz", "still")
+    expect(one, message("u-baz", "still"), "but still gets its other channel's")
+
+    print("== a channel the client isn't subscribed to leaves the count as it was")
+    run(one, unsubscribed("u-nope", 1), "UNSUBSCRIBE", "u-nope")
+    run(Client(), unsubscribed("u-nope", 0), "UNSUBSCRIBE", "u-nope")
+
+    print("== several channels, and no channels meaning all of them")
+    run(two, subscribed("u-a", 3) + subscribed("u-b", 4), "SUBSCRIBE", "u-a", "u-b")
+    run(two, unsubscribed("u-a", 3) + unsubscribed("u-bar", 2), "UNSUBSCRIBE", "u-a", "u-bar")
+    run(two, unsubscribed("u-foo", 1) + unsubscribed("u-b", 0), "UNSUBSCRIBE")
+    run(two, b"*3\r\n" + bulk("unsubscribe") + b"$-1\r\n:0\r\n", "UNSUBSCRIBE")
+
+    print("== with no channels left, the client is out of subscribed mode")
+    run(two, b"+PONG\r\n", "PING")
+    run(two, OK, "SET", "after", "pubsub")
+    command(b":0\r\n", "PUBLISH", "u-b", "nobody")
+    run(one, unsubscribed("u-baz", 0), "UNSUBSCRIBE", "u-baz")
+    run(one, bulk("pubsub"), "GET", "after")
+
+    print("== a message published before UNSUBSCRIBE still comes before its reply")
+    run(one, subscribed("u-race", 1), "SUBSCRIBE", "u-race")
+    racer = Client()
+    run(racer, b":1\r\n", "PUBLISH", "u-race", "first")
+    run(one, message("u-race", "first") + unsubscribed("u-race", 0), "UNSUBSCRIBE", "u-race")
 
     print("== PUBLISH's arity, and inside a transaction")
     command(b"-ERR wrong number of arguments for 'publish' command\r\n", "PUBLISH", "news")

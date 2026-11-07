@@ -512,6 +512,12 @@ async fn serve_client(mut stream: TcpStream, db: &Db, session: &mut Session) -> 
         // so answer every complete command buffered so far, then read more.
         while let Some((request, len)) = Value::parse(&buf)? {
             buf.advance(len);
+            // Messages published before this command reach the client before its reply.
+            if let Some(inbox) = session.inbox.as_mut() {
+                while let Ok(message) = inbox.receiver.try_recv() {
+                    stream.write_all(&message).await?;
+                }
+            }
             if let Some(replies) = pubsub_command(&request, db, session) {
                 for reply in replies {
                     stream.write_all(&reply.encode()).await?;
@@ -564,8 +570,8 @@ async fn serve_client(mut stream: TcpStream, db: &Db, session: &mut Session) -> 
 }
 
 /// Handles the Pub/Sub commands that need the client's session and can reply more than
-/// once (SUBSCRIBE replies once for each channel), and refuses the commands that aren't
-/// allowed in subscribed mode. Returns `None` for any other command, which
+/// once (SUBSCRIBE and UNSUBSCRIBE reply once for each channel), and refuses the commands
+/// that aren't allowed in subscribed mode. Returns `None` for any other command, which
 /// `handle_request` deals with.
 fn pubsub_command(request: &Value, db: &Db, session: &mut Session) -> Option<Vec<Value>> {
     let Value::Array(items) = request else {
@@ -605,28 +611,50 @@ fn pubsub_command(request: &Value, db: &Db, session: &mut Session) -> Option<Vec
         };
         return Some(vec![reply]);
     }
-    if name != b"SUBSCRIBE" {
-        return None;
-    }
+    let subscribing = match name.as_slice() {
+        b"SUBSCRIBE" => true,
+        b"UNSUBSCRIBE" => false,
+        _ => return None,
+    };
     if session.transaction.is_some() {
         return Some(vec![Value::Error(
             "ERR Command not allowed inside a transaction".into(),
         )]);
     }
-    if channels.is_empty() {
-        return Some(vec![wrong_arity("subscribe")]);
-    }
     let mut db = db.lock().unwrap();
-    let inbox = session.inbox.get_or_insert_with(Inbox::new);
     let mut replies = Vec::new();
-    for &channel in channels {
-        // Subscribing to a channel again changes nothing.
-        if !session.subscriptions.iter().any(|c| c == channel) {
-            session.subscriptions.push(channel.to_vec());
-            let subscribers = db.channels.entry(channel.to_vec()).or_default();
-            subscribers.insert(inbox.id, inbox.sender.clone());
+    if subscribing {
+        if channels.is_empty() {
+            return Some(vec![wrong_arity("subscribe")]);
         }
-        replies.push(subscription_reply("subscribe", Some(channel), session.subscriptions.len()));
+        let inbox = session.inbox.get_or_insert_with(Inbox::new);
+        for &channel in channels {
+            // Subscribing to a channel again changes nothing.
+            if !session.subscriptions.iter().any(|c| c == channel) {
+                session.subscriptions.push(channel.to_vec());
+                let subscribers = db.channels.entry(channel.to_vec()).or_default();
+                subscribers.insert(inbox.id, inbox.sender.clone());
+            }
+            replies.push(subscription_reply("subscribe", Some(channel), session.subscriptions.len()));
+        }
+        return Some(replies);
+    }
+    // UNSUBSCRIBE with no channels means every channel the client is subscribed to.
+    let channels: Vec<Vec<u8>> = if channels.is_empty() {
+        session.subscriptions.clone()
+    } else {
+        channels.iter().map(|channel| channel.to_vec()).collect()
+    };
+    if channels.is_empty() {
+        return Some(vec![subscription_reply("unsubscribe", None, 0)]);
+    }
+    for channel in channels {
+        // Unsubscribing from a channel the client isn't subscribed to changes nothing.
+        if let Some(i) = session.subscriptions.iter().position(|c| *c == channel) {
+            session.subscriptions.remove(i);
+            unsubscribe(&mut db, &channel, session);
+        }
+        replies.push(subscription_reply("unsubscribe", Some(&channel), session.subscriptions.len()));
     }
     Some(replies)
 }
