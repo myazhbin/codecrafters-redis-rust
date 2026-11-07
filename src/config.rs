@@ -13,6 +13,36 @@ pub struct Config {
     pub dir: String,
     /// The RDB file's name, set with `--dbfilename`.
     pub dbfilename: String,
+    /// Whether writes are logged to an append-only file (AOF), set with `--appendonly`.
+    pub appendonly: bool,
+    /// The directory inside `dir` that holds the AOF files and their manifest, set with
+    /// `--appenddirname`.
+    pub appenddirname: String,
+    /// The name the AOF files' names start with, set with `--appendfilename`.
+    pub appendfilename: String,
+    /// How often writes to the AOF are flushed to disk, set with `--appendfsync`.
+    pub appendfsync: Fsync,
+}
+
+/// How often writes to the AOF are flushed to disk.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Fsync {
+    /// After every write, before the client gets its reply.
+    Always,
+    /// Once a second.
+    Everysec,
+    /// Whenever the operating system gets round to it.
+    No,
+}
+
+impl Fsync {
+    pub fn name(self) -> &'static str {
+        match self {
+            Fsync::Always => "always",
+            Fsync::Everysec => "everysec",
+            Fsync::No => "no",
+        }
+    }
 }
 
 impl Default for Config {
@@ -22,6 +52,10 @@ impl Default for Config {
             replicaof: None,
             dir: String::new(),
             dbfilename: "dump.rdb".to_string(),
+            appendonly: false,
+            appenddirname: "appendonlydir".to_string(),
+            appendfilename: "appendonly.aof".to_string(),
+            appendfsync: Fsync::Everysec,
         }
     }
 }
@@ -32,6 +66,10 @@ impl Config {
         vec![
             ("dir", self.dir.clone()),
             ("dbfilename", self.dbfilename.clone()),
+            ("appendonly", if self.appendonly { "yes" } else { "no" }.to_string()),
+            ("appenddirname", self.appenddirname.clone()),
+            ("appendfilename", self.appendfilename.clone()),
+            ("appendfsync", self.appendfsync.name().to_string()),
             ("port", self.port.to_string()),
         ]
     }
@@ -115,6 +153,20 @@ mod tests {
         let config = parse(&[]).unwrap();
         assert_eq!(config.dir, "/cwd");
         assert_eq!(config.dbfilename, "dump.rdb");
+    }
+
+    #[test]
+    fn aof_is_off_by_default() {
+        let config = parse(&[]).unwrap();
+        assert!(!config.appendonly);
+        assert_eq!(config.appenddirname, "appendonlydir");
+        assert_eq!(config.appendfilename, "appendonly.aof");
+        assert_eq!(config.appendfsync, Fsync::Everysec);
+        let params = config.params();
+        let param = |name| params.iter().find(|(n, _)| *n == name).unwrap().1.clone();
+        assert_eq!(param("appendonly"), "no");
+        assert_eq!(param("appendfsync"), "everysec");
+        assert_eq!(param("dir"), "/cwd");
     }
 
     #[test]

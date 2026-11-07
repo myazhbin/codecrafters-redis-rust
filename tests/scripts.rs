@@ -43,6 +43,7 @@ script_tests! {
     wait: "wait.py",
     replication: "replication.py",
     rdb: "rdb.py",
+    aof: "aof.py",
 }
 
 /// Runs tests/<script>, failing if it reports a failure, with the script's output shown.
