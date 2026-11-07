@@ -516,8 +516,9 @@ async fn handle_connection(mut stream: TcpStream, db: Db) -> Result<()> {
 }
 
 /// Handles the Pub/Sub commands that need the client's session and can reply more than
-/// once: SUBSCRIBE replies once for each channel. Returns `None` for any other command,
-/// which `handle_request` deals with.
+/// once (SUBSCRIBE replies once for each channel), and refuses the commands that aren't
+/// allowed in subscribed mode. Returns `None` for any other command, which
+/// `handle_request` deals with.
 fn pubsub_command(request: &Value, session: &mut Session) -> Option<Vec<Value>> {
     let Value::Array(items) = request else {
         return None;
@@ -530,7 +531,21 @@ fn pubsub_command(request: &Value, session: &mut Session) -> Option<Vec<Value>> 
         })
         .collect::<Option<_>>()?;
     let (name, channels) = args.split_first()?;
-    if !name.eq_ignore_ascii_case(b"SUBSCRIBE") {
+    let name = name.to_ascii_uppercase();
+    // A client subscribed to a channel is in subscribed mode, where it's only meant to be
+    // listening, so most commands are refused.
+    const ALLOWED_WHEN_SUBSCRIBED: &[&[u8]] = &[
+        b"SUBSCRIBE", b"UNSUBSCRIBE", b"PSUBSCRIBE", b"PUNSUBSCRIBE", b"SSUBSCRIBE",
+        b"SUNSUBSCRIBE", b"PING", b"QUIT", b"RESET",
+    ];
+    if !session.subscriptions.is_empty() && !ALLOWED_WHEN_SUBSCRIBED.contains(&name.as_slice()) {
+        let name = String::from_utf8_lossy(&name).to_lowercase();
+        return Some(vec![Value::Error(format!(
+            "ERR Can't execute '{name}': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT \
+             / RESET are allowed in this context"
+        ))]);
+    }
+    if name != b"SUBSCRIBE" {
         return None;
     }
     if session.transaction.is_some() {

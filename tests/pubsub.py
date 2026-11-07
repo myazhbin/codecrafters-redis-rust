@@ -30,6 +30,19 @@ with running_server():
     run(first, subscribed("baz", 3), "SUBSCRIBE", "baz")
     run(Client(), subscribed("foo", 1), "SUBSCRIBE", "foo")
 
+    print("== stage test: in subscribed mode, other commands are refused")
+    for args in [("SET", "key", "value"), ("GET", "key"), ("ECHO", "hey"), ("set", "k", "v"),
+                 ("MULTI",), ("RPUSH", "list", "a"), ("PUBLISH", "foo", "msg")]:
+        name = args[0].lower().encode()
+        run(first, b"-ERR Can't execute '%s': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT "
+                   b"/ RESET are allowed in this context\r\n" % name, *args)
+    run(first, subscribed("qux", 4), "SUBSCRIBE", "qux")
+    command(b"$-1\r\n", "GET", "key")
+
+    print("== clients that aren't subscribed can run anything")
+    command(OK, "SET", "key", "value")
+    command(b"$5\r\nvalue\r\n", "GET", "key")
+
     print("== arity, lowercase, and not inside a transaction")
     command(b"-ERR wrong number of arguments for 'subscribe' command\r\n", "SUBSCRIBE")
     command(subscribed("x", 1), "subscribe", "x")
