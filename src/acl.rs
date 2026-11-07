@@ -96,6 +96,13 @@ impl Users {
         Ok(())
     }
 
+    /// Whether `password` lets a client log in as the user called `name`.
+    pub fn check(&self, name: &[u8], password: &[u8]) -> bool {
+        self.get(name).is_some_and(|user| {
+            user.nopass || user.passwords.contains(&sha256_hex(password))
+        })
+    }
+
     /// The user a new connection is logged in as: the default user, unless it needs a
     /// password, in which case nobody until the client sends AUTH.
     pub fn new_connection_user(&self) -> Option<Vec<u8>> {
@@ -154,6 +161,16 @@ mod tests {
         assert!(users.set_user(DEFAULT_USER, &rules(&["<missing"])).is_err());
         assert!(users.set_user(DEFAULT_USER, &rules(&["#abc"])).is_err());
         assert!(users.set_user(DEFAULT_USER, &rules(&[&format!("#{}", MYPASSWORD.to_uppercase())])).is_err());
+    }
+
+    #[test]
+    fn checks_passwords() {
+        let mut users = Users::default();
+        assert!(users.check(DEFAULT_USER, b"anything"));
+        users.set_user(DEFAULT_USER, &rules(&[">mypassword"])).unwrap();
+        assert!(users.check(DEFAULT_USER, b"mypassword"));
+        assert!(!users.check(DEFAULT_USER, b"wrongpassword"));
+        assert!(!users.check(b"nobody", b"mypassword"));
     }
 
     #[test]

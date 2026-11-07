@@ -843,6 +843,32 @@ async fn handle_request(request: Value, db: &Db, session: &mut Session) -> Value
                 None => Value::Error("NOAUTH Authentication required.".into()),
             }
         }
+        Some(b"AUTH") => {
+            let db = db.lock().unwrap();
+            let (name, password) = match &command[1..] {
+                [password] => {
+                    // The default user has to have a password for it to be given on its own.
+                    let default = db.users.get(acl::DEFAULT_USER);
+                    if default.is_none_or(|user| user.nopass) {
+                        return Value::Error(
+                            "ERR AUTH <password> called without any password configured for \
+                             the default user. Are you sure your configuration is correct?"
+                                .into(),
+                        );
+                    }
+                    (acl::DEFAULT_USER, password)
+                }
+                [name, password] => (name.as_slice(), password),
+                [] => return wrong_arity("auth"),
+                _ => return Value::Error("ERR syntax error".into()),
+            };
+            if db.users.check(name, password) {
+                session.user = Some(name.to_vec());
+                Value::SimpleString("OK".into())
+            } else {
+                Value::Error("WRONGPASS invalid username-password pair or user is disabled.".into())
+            }
+        }
         Some(b"MULTI") => wrong_arity("multi"),
         Some(b"EXEC") => wrong_arity("exec"),
         Some(b"DISCARD") => wrong_arity("discard"),

@@ -8,6 +8,7 @@ from helpers import OK, Client, bulk, command, encode, finish, run, running_serv
 MYPASSWORD = "89e01536ac207279409d4de1e5253e01f4a1769e696db0d6062ca9b8f56767c8"
 SECOND = "16367aacb67a4a017c8da8ab95682ccb390863780f7114dda0a0e0c55644c7c4"
 SECRET = "2bb80d537b1da3e38bd30361aa855686bde0eacd7162fef6a25fe97bf527a25b"
+WRONGPASS = b"-WRONGPASS invalid username-password pair or user is disabled.\r\n"
 
 
 def getuser(flags, passwords):
@@ -64,5 +65,27 @@ with running_server():
     print("== SETUSER creates a user that isn't there")
     run(client, OK, "ACL", "SETUSER", "alice", ">secret")
     run(client, getuser([], [SECRET]), "ACL", "GETUSER", "alice")
+
+with running_server():
+    print("== with nopass, any password will do, but not one on its own")
+    command(OK, "AUTH", "default", "anything")
+    command(b"-ERR AUTH <password> called without any password configured for the default user. "
+            b"Are you sure your configuration is correct?\r\n", "AUTH", "anything")
+
+    print("== stage test: AUTH checks the password")
+    client = Client()
+    run(client, OK, "ACL", "SETUSER", "default", ">mypassword")
+    run(client, WRONGPASS, "AUTH", "default", "wrongpassword")
+    run(client, OK, "AUTH", "default", "mypassword")
+
+    print("== the password alone means the default user; other users; errors")
+    run(client, OK, "AUTH", "mypassword")
+    run(client, WRONGPASS, "AUTH", "wrongpassword")
+    run(client, WRONGPASS, "AUTH", "nobody", "mypassword")
+    run(client, OK, "ACL", "SETUSER", "alice", ">secret")
+    run(client, WRONGPASS, "AUTH", "alice", "mypassword")
+    run(client, OK, "AUTH", "alice", "secret")
+    run(client, b"-ERR wrong number of arguments for 'auth' command\r\n", "AUTH")
+    run(client, b"-ERR syntax error\r\n", "AUTH", "a", "b", "c")
 
 finish()
