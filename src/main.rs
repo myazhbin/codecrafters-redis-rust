@@ -5,11 +5,13 @@ mod config;
 mod glob;
 mod rdb;
 mod resp;
+mod zset;
 
 use anyhow::{Context, Result, bail};
 use bytes::{Buf, BytesMut};
 use config::Config;
 use resp::Value;
+use zset::SortedSet;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -166,6 +168,7 @@ enum Data {
     String(Vec<u8>),
     List(VecDeque<Vec<u8>>),
     Stream(Vec<StreamEntry>),
+    SortedSet(SortedSet),
 }
 
 struct StreamEntry {
@@ -880,6 +883,7 @@ fn propagate_write(db: &mut Store, command: &[Vec<u8>], reply: &Value) {
         (b"SET" | b"RPUSH" | b"LPUSH" | b"INCR", _) => db.propagate(command),
         (b"LPOP", Value::BulkString(_)) => db.propagate(command),
         (b"DEL", Value::Integer(removed)) if *removed > 0 => db.propagate(command),
+        (b"ZADD", Value::Integer(_)) => db.propagate(command),
         (b"LPOP", Value::Array(popped)) if !popped.is_empty() => db.propagate(command),
         // With the ID spelled out, because a replica would generate a different one.
         (b"XADD", Value::BulkString(id)) => {
@@ -985,6 +989,7 @@ fn run_command(db: &mut Store, command: &[Vec<u8>]) -> Value {
                     Some(Data::String(_)) => "string",
                     Some(Data::List(_)) => "list",
                     Some(Data::Stream(_)) => "stream",
+                    Some(Data::SortedSet(_)) => "zset",
                     None => "none",
                 };
                 Value::SimpleString(kind.into())
@@ -1038,6 +1043,13 @@ fn run_command(db: &mut Store, command: &[Vec<u8>]) -> Value {
         b"PUBLISH" => match args {
             [channel, message] => publish(db, channel, message),
             _ => wrong_arity("publish"),
+        },
+        b"ZADD" => match args {
+            [_, _, _, ..] if args.len() % 2 == 0 => {
+                Value::Error("ERR syntax error".into())
+            }
+            [key, pairs @ ..] if pairs.len() >= 2 => zadd(db, key, pairs),
+            _ => wrong_arity("zadd"),
         },
         b"KEYS" => match args {
             [pattern] => matching_keys(db, pattern),
@@ -1565,6 +1577,31 @@ fn entries_after(db: &mut Store, keys: &[Vec<u8>], afters: &[StreamId]) -> Optio
     } else {
         Some(Value::Array(streams))
     }
+}
+
+/// ZADD: adds each member with the score before it, or gives a member that's already
+/// there its new score. Replies with how many members were new.
+fn zadd(db: &mut Store, key: &[u8], pairs: &[Vec<u8>]) -> Value {
+    // Every score is checked before anything changes.
+    let mut members = Vec::new();
+    for pair in pairs.chunks(2) {
+        let Some(score) = zset::parse_score(&pair[0]) else {
+            return Value::Error("ERR value is not a valid float".into());
+        };
+        members.push((score, &pair[1]));
+    }
+    let new_set = Data::SortedSet(SortedSet::default());
+    let Data::SortedSet(set) = live_value_or_insert(db, key, new_set) else {
+        return wrong_type();
+    };
+    let mut added = 0;
+    for (score, member) in members {
+        if set.insert(member, score) {
+            added += 1;
+        }
+    }
+    db.touch(key);
+    Value::Integer(added)
 }
 
 /// KEYS: every key that matches `pattern`, in no particular order. Keys that have expired

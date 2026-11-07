@@ -46,6 +46,7 @@ script_tests! {
     aof: "aof.py",
     del: "del.sh",
     pubsub: "pubsub.py",
+    zset: "zset.sh",
 }
 
 /// Runs tests/<script>, failing if it reports a failure, with the script's output shown.
