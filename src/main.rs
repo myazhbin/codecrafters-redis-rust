@@ -2,6 +2,7 @@
 
 mod config;
 mod glob;
+mod rdb;
 mod resp;
 
 use anyhow::{Result, bail};
@@ -210,6 +211,7 @@ async fn main() {
         config: config.clone(),
         ..Store::default()
     }));
+    load_rdb_file(&mut db.lock().unwrap(), &config);
 
     if let Some((host, master_port)) = config.replicaof {
         let db = db.clone();
@@ -260,11 +262,62 @@ async fn connect_to_master(host: &str, port: u16, listening_port: u16, db: &Db) 
     let Some(offset) = parse_fullresync(&reply) else {
         bail!("the reply to PSYNC was: {reply:?}");
     };
-    // The master's data comes as an RDB file, but masters here only ever send empty ones,
-    // so there's nothing to load.
-    read_from_master(&mut master, &mut buf, resp::parse_file).await?;
-    db.lock().unwrap().repl_offset = offset;
+    // The master's data comes as an RDB file. Masters here only ever send empty ones, but
+    // a real Redis master sends what it has.
+    let rdb = read_from_master(&mut master, &mut buf, resp::parse_file).await?;
+    {
+        let mut db = db.lock().unwrap();
+        load_rdb(&mut db, &rdb);
+        db.repl_offset = offset;
+    }
     follow_master(&mut master, &mut buf, db).await
+}
+
+/// Loads the keys from the RDB file that `--dir` and `--dbfilename` name, if it exists.
+fn load_rdb_file(db: &mut Store, config: &Config) {
+    let path = std::path::Path::new(&config.dir).join(&config.dbfilename);
+    match std::fs::read(&path) {
+        Ok(data) => load_rdb(db, &data),
+        // With no file yet, the database starts out empty.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => eprintln!("couldn't read {}: {e}", path.display()),
+    }
+}
+
+/// Adds the keys in an RDB file to the database, apart from any that have already
+/// expired. A file that can't be read adds nothing.
+fn load_rdb(db: &mut Store, data: &[u8]) {
+    let keys = match rdb::parse(data) {
+        Ok(keys) => keys,
+        Err(e) => {
+            eprintln!("couldn't load the RDB file: {e:#}");
+            return;
+        }
+    };
+    let now_ms = unix_time_ms();
+    for key in keys {
+        // With no SELECT here, only database 0 can be used.
+        if key.db != 0 {
+            continue;
+        }
+        let expires_at = match key.expires_at_ms {
+            None => None,
+            Some(at) if at <= now_ms => continue,
+            // An expiry too far off to represent might as well be none.
+            Some(at) => Instant::now().checked_add(Duration::from_millis(at - now_ms)),
+        };
+        let entry = Entry {
+            value: Data::String(key.value),
+            expires_at,
+        };
+        db.entries.insert(key.key, entry);
+    }
+}
+
+/// The current Unix time in milliseconds.
+fn unix_time_ms() -> u64 {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH);
+    now.unwrap_or_default().as_millis() as u64
 }
 
 /// Sends a command to the master and waits for its reply, which mustn't be an error.
@@ -701,6 +754,10 @@ fn run_command(db: &mut Store, command: &[Vec<u8>]) -> Value {
             [key] => increment(db, key),
             _ => wrong_arity("incr"),
         },
+        b"KEYS" => match args {
+            [pattern] => matching_keys(db, pattern),
+            _ => wrong_arity("keys"),
+        },
         // `handle_request` handles UNWATCH outside a transaction. Inside one, it's left
         // with nothing to do: EXEC has already stopped watching by the time it runs.
         b"UNWATCH" => match args {
@@ -1008,13 +1065,8 @@ fn add_to_stream(db: &mut Store, key: &[u8], id: &[u8], fields: &[Vec<u8>]) -> V
     };
     // A new stream counts as ending at 0-0, below every ID it can be given.
     let last = stream.last().map_or(StreamId::MIN, |entry| entry.id);
-    let ms = ms.unwrap_or_else(|| {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default();
-        // If the clock has gone backwards, carry on from the last entry's time.
-        (now.as_millis() as u64).max(last.ms)
-    });
+    // If the clock has gone backwards, carry on from the last entry's time.
+    let ms = ms.unwrap_or_else(|| unix_time_ms().max(last.ms));
     let seq = match seq {
         Some(seq) => seq,
         // Within the same millisecond, carry on from the last entry's sequence number.
@@ -1208,6 +1260,20 @@ fn entries_after(db: &mut Store, keys: &[Vec<u8>], afters: &[StreamId]) -> Optio
     } else {
         Some(Value::Array(streams))
     }
+}
+
+/// KEYS: every key that matches `pattern`, in no particular order. Keys that have expired
+/// are removed, as looking at them would.
+fn matching_keys(db: &mut Store, pattern: &[u8]) -> Value {
+    let keys: Vec<Vec<u8>> = db.entries.keys().cloned().collect();
+    let mut found = Vec::new();
+    for key in keys {
+        remove_if_expired(db, &key);
+        if db.entries.contains_key(&key) && glob::matches(pattern, &key, false) {
+            found.push(Value::BulkString(key));
+        }
+    }
+    Value::Array(found)
 }
 
 /// Adds 1 to the integer stored at `key`, where a missing key counts as 0, and replies
