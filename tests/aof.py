@@ -6,8 +6,9 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 
-from helpers import (DEFAULT_BINARY, OTHER_PORT, check, command, encode, finish,
+from helpers import (DEFAULT_BINARY, OK, OTHER_PORT, check, command, encode, finish,
                      running_server)
 
 BINARY = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_BINARY
@@ -23,6 +24,33 @@ DEFAULTS = {
 def config(name, value):
     """Checks CONFIG GET's reply for one parameter."""
     command(encode(name, value), "CONFIG", "GET", name)
+
+
+def commands_in(data):
+    """The commands in an AOF file's contents, each a list of its arguments as strings.
+    Arguments mustn't contain \\r\\n, which is enough for these tests."""
+    commands, lines = [], data.split(b"\r\n")
+    i = 0
+    while i < len(lines) and lines[i].startswith(b"*"):
+        count = int(lines[i][1:])
+        commands.append([line.decode() for line in lines[i + 2:i + 2 + 2 * count:2]])
+        i += 1 + 2 * count
+    return commands
+
+
+def read(path):
+    with open(path, "rb") as f:
+        return f.read()
+
+
+def manifest_naming(aof_dir, appendfilename, incr_name):
+    """Sets up an append-only directory as the tester does: a manifest naming an
+    incremental file that isn't the default one, and that file, empty."""
+    os.makedirs(aof_dir, exist_ok=True)
+    with open(os.path.join(aof_dir, f"{appendfilename}.manifest"), "wb") as f:
+        f.write(b"file %s seq 1 type i\n" % incr_name.encode())
+    open(os.path.join(aof_dir, incr_name), "wb").close()
+    return os.path.join(aof_dir, incr_name)
 
 
 def file_is(path, want, label):
@@ -114,6 +142,44 @@ with tempfile.TemporaryDirectory() as tmp:
         file_is(manifest, custom, "the manifest is unchanged")
         check("the file it lists is created", os.path.isfile(os.path.join(aof_dir, "custom.1.incr.aof")))
 
+with tempfile.TemporaryDirectory() as tmp:
+    aof_dir = os.path.join(tmp, "aofdir")
+    incr = manifest_naming(aof_dir, "log.aof", "blueberry.1.incr.aof")
+    always = ("--dir", tmp, "--appendonly", "yes", "--appenddirname", "aofdir",
+              "--appendfilename", "log.aof", "--appendfsync", "always")
+
+    print("== stage test: a write goes to the file the manifest names, before the reply")
+    with running_server(*always):
+        command(OK, "SET", "foo", "100")
+        file_is(incr, encode("SET", "foo", "100"), "the AOF file holds the SET")
+        check("no file with the default name is created",
+              not os.path.exists(os.path.join(aof_dir, "log.aof.1.incr.aof")))
+
+        print("== a SET's expiry is logged as the Unix time it expires at")
+        before = int(time.time() * 1000)
+        command(OK, "SET", "temp", "v", "EX", "10")
+        after = int(time.time() * 1000)
+        logged = commands_in(read(incr))[-1]
+        ok = logged[:4] == ["SET", "temp", "v", "PXAT"] and before + 10000 <= int(logged[4]) <= after + 10000
+        check("SET temp v EX 10 is logged with PXAT", ok, f"logged {logged}")
+        command(b"$1\r\nv\r\n", "GET", "temp")
+
+    print("== SET understands PXAT and EXAT, as the AOF can hold them")
+    with running_server(*always):
+        later = int(time.time() * 1000) + 60000
+        command(OK, "SET", "a", "1", "PXAT", str(later))
+        command(b"$1\r\n1\r\n", "GET", "a")
+        command(OK, "SET", "b", "2", "EXAT", str(later // 1000))
+        command(b"$1\r\n2\r\n", "GET", "b")
+        command(OK, "SET", "gone", "3", "PXAT", "1000")
+        command(b"$-1\r\n", "GET", "gone")
+        command(b"-ERR invalid expire time in 'set' command\r\n", "SET", "c", "4", "PXAT", "0")
+
+with tempfile.TemporaryDirectory() as tmp:
+    aof_args = ("--dir", tmp, "--appendonly", "yes", "--appenddirname", "appendonlydir",
+                "--appendfilename", "appendonly.aof")
+    manifest = os.path.join(tmp, "appendonlydir", "appendonly.aof.manifest")
+    os.makedirs(os.path.dirname(manifest))
     print("== the server exits with a message if the manifest makes no sense")
     with open(manifest, "wb") as f:
         f.write(b"file custom.1.incr.aof seq 1\n")

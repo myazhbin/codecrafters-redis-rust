@@ -49,6 +49,8 @@ struct Store {
     write_offset: u64,
     /// The settings the server started with, for CONFIG GET.
     config: Config,
+    /// With `--appendonly yes`, the append-only file that writes are logged to.
+    aof: Option<aof::Aof>,
 }
 
 impl Store {
@@ -122,10 +124,13 @@ impl Store {
             .retain(|_, replica| replica.stream.send(encoded.clone()).is_ok());
     }
 
-    /// Sends a write to the replicas, to keep them in step.
+    /// Sends a write to the replicas, to keep them in step, and logs it to the AOF.
     fn propagate<T: AsRef<[u8]>>(&mut self, command: &[T]) {
         self.send_to_replicas(command);
         self.write_offset = self.repl_offset;
+        if let Some(aof) = &mut self.aof {
+            aof.append(&aof::logged_form(command, unix_time_ms()));
+        }
     }
 
     /// Propagates the pop of an element from the list at `key`. Replicas get it as LPOP
@@ -214,9 +219,13 @@ async fn main() {
     // The data and the AOF's files are ready before the server starts listening, so that a
     // client can't get in first.
     if config.appendonly {
-        if let Err(e) = aof::set_up(&config) {
-            eprintln!("{e:#}");
-            std::process::exit(1);
+        let opened = aof::set_up(&config).and_then(|files| aof::Aof::open(&config, &files));
+        match opened {
+            Ok(aof) => db.lock().unwrap().aof = Some(aof),
+            Err(e) => {
+                eprintln!("{e:#}");
+                std::process::exit(1);
+            }
         }
     }
     load_rdb_file(&mut db.lock().unwrap(), &config);
@@ -811,24 +820,29 @@ fn invalid_stream_id() -> Value {
     Value::Error("ERR Invalid stream ID specified as stream command argument".into())
 }
 
-/// Parses the options after `SET key value`. So far only an `EX seconds` or
-/// `PX milliseconds` expiry is supported.
+/// Parses the options after `SET key value`. So far only an expiry is supported: in
+/// `EX seconds` or `PX milliseconds` from now, or at the Unix time `EXAT seconds` or
+/// `PXAT milliseconds`.
 fn parse_expiry(options: &[Vec<u8>]) -> Result<Option<Instant>, &'static str> {
     let (unit, amount) = match options {
         [] => return Ok(None),
         [unit, amount] => (unit.to_ascii_uppercase(), amount),
         _ => return Err("ERR syntax error"),
     };
-    let to_duration: fn(u64) -> Duration = match unit.as_slice() {
+    // How long from now until the key expires, given the amount: EX and PX count from
+    // now, and EXAT and PXAT give a Unix time, which may already have passed.
+    let from_now: fn(u64) -> Duration = match unit.as_slice() {
         b"EX" => Duration::from_secs,
         b"PX" => Duration::from_millis,
+        b"EXAT" => |secs| Duration::from_millis(secs.saturating_mul(1000).saturating_sub(unix_time_ms())),
+        b"PXAT" => |ms| Duration::from_millis(ms.saturating_sub(unix_time_ms())),
         _ => return Err("ERR syntax error"),
     };
     let Some(amount) = parse_number::<u64>(amount) else {
         return Err("ERR value is not an integer or out of range");
     };
     // checked_add so that an absurdly long expiry is an error rather than a panic.
-    match Instant::now().checked_add(to_duration(amount)) {
+    match Instant::now().checked_add(from_now(amount)) {
         Some(expires_at) if amount > 0 => Ok(Some(expires_at)),
         _ => Err("ERR invalid expire time in 'set' command"),
     }

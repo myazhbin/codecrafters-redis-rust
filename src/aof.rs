@@ -7,10 +7,82 @@
 //! incremental file, which writes are appended to; there can also be a base file (`b`)
 //! that the incremental ones carry on from, and old files kept as history (`h`).
 
-use crate::config::Config;
+use crate::config::{Config, Fsync};
+use crate::resp::Value;
 use anyhow::{Context, Result, bail};
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+/// The incremental AOF file, open for writes to be appended to it.
+pub struct Aof {
+    file: File,
+    fsync: Fsync,
+}
+
+impl Aof {
+    /// Opens the incremental file listed in `entries` for appending. With `everysec`, a
+    /// thread flushes it to disk once a second.
+    pub fn open(config: &Config, entries: &[ManifestEntry]) -> Result<Aof> {
+        let incr = incr_file(entries).context("the manifest lists no incremental file")?;
+        let path = dir(config).join(&incr.file);
+        let file = OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .with_context(|| format!("couldn't open the append-only file {}", path.display()))?;
+        if config.appendfsync == Fsync::Everysec {
+            let file = file.try_clone()?;
+            std::thread::spawn(move || {
+                loop {
+                    std::thread::sleep(Duration::from_secs(1));
+                    if let Err(e) = file.sync_data() {
+                        eprintln!("couldn't flush the append-only file: {e}");
+                    }
+                }
+            });
+        }
+        Ok(Aof {
+            file,
+            fsync: config.appendfsync,
+        })
+    }
+
+    /// Appends a write, in RESP, as clients send commands. With `always`, it's flushed to
+    /// disk straight away, which is before the client that sent it gets a reply.
+    pub fn append(&mut self, command: &[Vec<u8>]) {
+        let data = Value::command(command).encode();
+        let mut result = self.file.write_all(&data);
+        if result.is_ok() && self.fsync == Fsync::Always {
+            result = self.file.sync_data();
+        }
+        if let Err(e) = result {
+            eprintln!("couldn't write to the append-only file: {e}");
+        }
+    }
+}
+
+/// How a write is logged: as it's sent to replicas, except that a SET's expiry in seconds
+/// or milliseconds from now becomes the Unix time it'll expire at (`now_ms` being now), so
+/// that replaying the file later doesn't put the expiry off.
+pub fn logged_form<T: AsRef<[u8]>>(command: &[T], now_ms: u64) -> Vec<Vec<u8>> {
+    let mut command: Vec<Vec<u8>> = command.iter().map(|arg| arg.as_ref().to_vec()).collect();
+    if let [name, _, _, unit, amount] = &command[..]
+        && name.eq_ignore_ascii_case(b"SET")
+        && let Ok(amount) = std::str::from_utf8(amount).unwrap_or_default().parse::<u64>()
+    {
+        let at = match unit.to_ascii_uppercase().as_slice() {
+            b"EX" => Some(now_ms.saturating_add(amount.saturating_mul(1000))),
+            b"PX" => Some(now_ms.saturating_add(amount)),
+            _ => None,
+        };
+        if let Some(at) = at {
+            command[3] = b"PXAT".to_vec();
+            command[4] = at.to_string().into_bytes();
+        }
+    }
+    command
+}
 
 /// The directory that holds the AOF's files.
 pub fn dir(config: &Config) -> PathBuf {
@@ -229,6 +301,22 @@ mod tests {
             seq,
             kind,
         }
+    }
+
+    fn logged(command: &[&str]) -> Vec<String> {
+        let logged = logged_form(command, 1_000_000);
+        logged.into_iter().map(|arg| String::from_utf8(arg).unwrap()).collect()
+    }
+
+    #[test]
+    fn logs_writes_as_they_came_except_for_relative_expiries() {
+        assert_eq!(logged(&["SET", "k", "v"]), ["SET", "k", "v"]);
+        assert_eq!(logged(&["INCR", "k"]), ["INCR", "k"]);
+        assert_eq!(logged(&["SET", "k", "v", "EX", "10"]), ["SET", "k", "v", "PXAT", "1010000"]);
+        assert_eq!(logged(&["set", "k", "v", "px", "500"]), ["set", "k", "v", "PXAT", "1000500"]);
+        // Already absolute.
+        assert_eq!(logged(&["SET", "k", "v", "PXAT", "5"]), ["SET", "k", "v", "PXAT", "5"]);
+        assert_eq!(logged(&["SET", "k", "v", "EXAT", "5"]), ["SET", "k", "v", "EXAT", "5"]);
     }
 
     #[test]
