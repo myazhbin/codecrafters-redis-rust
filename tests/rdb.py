@@ -144,6 +144,18 @@ with tempfile.TemporaryDirectory() as tmp:
         command(OK, "SET", "int16", "replaced")
         command(bulk("replaced"), "GET", "int16")
 
+    print("== stage test: KEYS * lists every key in the RDB file")
+    fruits = [("banana", "1"), ("mango", "2"), ("grape", "3"), ("apple", "4")]
+    with server_with_rdb(tmp, rdb_file(*fruits)):
+        unordered([key for key, _ in fruits], "KEYS", "*")
+        unordered(["mango", "grape"], "KEYS", "*g*")
+
+    print("== only keys in database 0 are loaded, as there's no SELECT")
+    two_dbs = rdb_file(("in-db-0", "a")).replace(
+        b"\xff" + b"\x00" * 8, b"\xfe\x01\x00" + string("in-db-1") + string("b") + b"\xff" + b"\x00" * 8)
+    with server_with_rdb(tmp, two_dbs):
+        command(encode("in-db-0"), "KEYS", "*")
+
     print("== an RDB file that doesn't exist means an empty database")
     with running_server("--dir", tmp, "--dbfilename", "nosuchfile.rdb"):
         command(b"*0\r\n", "KEYS", "*")
