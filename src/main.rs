@@ -481,8 +481,12 @@ struct Session {
     subscriptions: Vec<Vec<u8>>,
     /// Where messages published to those channels arrive, once the client has subscribed.
     inbox: Option<Inbox>,
-    /// The user the client is logged in as, if any.
-    user: Option<Vec<u8>>,
+    /// The user the client is acting as: the default user until it logs in as another.
+    user: Vec<u8>,
+    /// Whether the client has logged in: with AUTH, or by connecting while the default user
+    /// needed no password. Only a client that hasn't is asked to, and only while the default
+    /// user needs a password.
+    authenticated: bool,
 }
 
 /// Where the messages published to a client's channels arrive, ready to send it.
@@ -506,9 +510,10 @@ impl Inbox {
 }
 
 async fn handle_connection(stream: TcpStream, db: Db) -> Result<()> {
-    let user = db.lock().unwrap().users.new_connection_user();
+    let authenticated = db.lock().unwrap().users.default_needs_no_password();
     let mut session = Session {
-        user,
+        user: acl::DEFAULT_USER.to_vec(),
+        authenticated,
         ..Session::default()
     };
     let result = serve_client(stream, &db, &mut session).await;
@@ -533,8 +538,11 @@ async fn serve_client(mut stream: TcpStream, db: &Db, session: &mut Session) -> 
                     stream.write_all(&message).await?;
                 }
             }
-            // A client that isn't logged in can only log in.
-            if session.user.is_none() && !is_command(&request, b"AUTH") {
+            // A client that has to log in can't do anything else first.
+            if !session.authenticated
+                && !is_command(&request, b"AUTH")
+                && !db.lock().unwrap().users.default_needs_no_password()
+            {
                 let reply = Value::Error("NOAUTH Authentication required.".into());
                 stream.write_all(&reply.encode()).await?;
                 continue;
@@ -844,10 +852,7 @@ async fn handle_request(request: Value, db: &Db, session: &mut Session) -> Value
             if command.len() != 2 {
                 return wrong_arity("acl|whoami");
             }
-            match &session.user {
-                Some(user) => Value::BulkString(user.clone()),
-                None => Value::Error("NOAUTH Authentication required.".into()),
-            }
+            Value::BulkString(session.user.clone())
         }
         Some(b"AUTH") => {
             let db = db.lock().unwrap();
@@ -869,7 +874,8 @@ async fn handle_request(request: Value, db: &Db, session: &mut Session) -> Value
                 _ => return Value::Error("ERR syntax error".into()),
             };
             if db.users.check(name, password) {
-                session.user = Some(name.to_vec());
+                session.user = name.to_vec();
+                session.authenticated = true;
                 Value::SimpleString("OK".into())
             } else {
                 Value::Error("WRONGPASS invalid username-password pair or user is disabled.".into())

@@ -103,11 +103,10 @@ impl Users {
         })
     }
 
-    /// The user a new connection is logged in as: the default user, unless it needs a
-    /// password, in which case nobody until the client sends AUTH.
-    pub fn new_connection_user(&self) -> Option<Vec<u8>> {
-        let default = self.get(DEFAULT_USER)?;
-        default.nopass.then(|| DEFAULT_USER.to_vec())
+    /// Whether the default user needs no password. While that's so, every connection can
+    /// run commands as the default user, as in Redis, whether or not it has logged in.
+    pub fn default_needs_no_password(&self) -> bool {
+        self.get(DEFAULT_USER).is_some_and(|user| user.nopass)
     }
 }
 
@@ -129,11 +128,11 @@ mod tests {
     fn a_password_replaces_nopass() {
         let mut users = Users::default();
         assert!(default(&users).nopass);
-        assert_eq!(users.new_connection_user(), Some(DEFAULT_USER.to_vec()));
+        assert!(users.default_needs_no_password());
         users.set_user(DEFAULT_USER, &rules(&[">mypassword"])).unwrap();
         assert!(!default(&users).nopass);
         assert_eq!(default(&users).passwords, [MYPASSWORD]);
-        assert_eq!(users.new_connection_user(), None);
+        assert!(!users.default_needs_no_password());
     }
 
     #[test]
