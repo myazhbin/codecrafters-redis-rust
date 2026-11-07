@@ -1134,6 +1134,30 @@ fn run_command(db: &mut Store, command: &[Vec<u8>]) -> Value {
             ),
             _ => wrong_arity("geoadd"),
         },
+        b"GEOPOS" => match args {
+            [key, members @ ..] => {
+                let set = match live_value(db, key) {
+                    Some(Data::SortedSet(set)) => Some(&*set),
+                    Some(_) => return wrong_type(),
+                    None => None,
+                };
+                // Each member's longitude and latitude, or a null array if it isn't there.
+                let positions = members.iter().map(|member| {
+                    match set.and_then(|set| set.score(member)) {
+                        Some(score) => {
+                            let (longitude, latitude) = geo::decode(score as u64);
+                            Value::Array(vec![
+                                Value::BulkString(zset::format_score(longitude).into_bytes()),
+                                Value::BulkString(zset::format_score(latitude).into_bytes()),
+                            ])
+                        }
+                        None => Value::NullArray,
+                    }
+                });
+                Value::Array(positions.collect())
+            }
+            _ => wrong_arity("geopos"),
+        },
         b"ZADD" => match args {
             [_, _, _, ..] if args.len() % 2 == 0 => {
                 Value::Error("ERR syntax error".into())

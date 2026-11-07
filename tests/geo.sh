@@ -48,6 +48,20 @@ check '$16\r\n3252046221964352\r\n' ZSCORE scored Sydney
 check '$16\r\n1791873974549446\r\n' ZSCORE scored NewYork
 check "$(array NewYork London Sydney Paris Munich Bangkok)" ZRANGE scored 0 -1
 
+echo "== stage test: GEOPOS gives a position for each location, or a null array"
+check ':1\r\n' GEOADD location_key -0.0884948 51.506479 London
+check ':1\r\n' GEOADD location_key 11.5030378 48.164271 Munich
+check "*2\\r\\n$(array -0.08849412202835083 51.50647814139934)$(array 11.503036916255951 48.16427086232977)" \
+  GEOPOS location_key London Munich
+check '*1\r\n*-1\r\n' GEOPOS location_key missing_location
+check '*2\r\n*-1\r\n*-1\r\n' GEOPOS missing_key London Munich
+check "*3\\r\\n*-1\\r\\n$(array -0.08849412202835083 51.50647814139934)*-1\\r\\n" \
+  GEOPOS location_key nowhere London nowhere
+check '*0\r\n' GEOPOS location_key
+check '+OK\r\n' SET a-string v
+check "$wrongtype" GEOPOS a-string London
+check "-ERR wrong number of arguments for 'geopos' command\\r\\n" GEOPOS
+
 echo "== arity and syntax"
 check "-ERR wrong number of arguments for 'geoadd' command\\r\\n" GEOADD places 1 2
 check '-ERR syntax error. Try GEOADD key [x1] [y1] [name1] [x2] [y2] [name2] ... \r\n' GEOADD places 1 2 a 3
