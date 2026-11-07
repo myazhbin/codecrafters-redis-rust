@@ -1337,9 +1337,13 @@ fn run_command(db: &mut Store, command: &[Vec<u8>]) -> Value {
                             if user.nopass {
                                 flags.push(Value::BulkString(b"nopass".to_vec()));
                             }
+                            let passwords = user.passwords.iter();
+                            let passwords = passwords.map(|hash| Value::BulkString(hash.clone().into_bytes()));
                             Value::Array(vec![
                                 Value::BulkString(b"flags".to_vec()),
                                 Value::Array(flags),
+                                Value::BulkString(b"passwords".to_vec()),
+                                Value::Array(passwords.collect()),
                             ])
                         }
                         None => Value::NullBulkString,
