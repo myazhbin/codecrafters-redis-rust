@@ -8,8 +8,8 @@ import sys
 import tempfile
 import time
 
-from helpers import (DEFAULT_BINARY, OK, OTHER_PORT, QUEUED, Client, check, command, encode,
-                     finish, run, running_server)
+from helpers import (DEFAULT_BINARY, OK, OTHER_PORT, QUEUED, WRONGTYPE, Client, check, command,
+                     encode, finish, run, running_server)
 
 BINARY = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_BINARY
 
@@ -211,6 +211,42 @@ with tempfile.TemporaryDirectory() as tmp:
         ]
         got = commands_in(read(incr))
         check("the AOF holds all the writes, in order", got == want, f"want {want}, got {got}")
+
+with tempfile.TemporaryDirectory() as tmp:
+    incr = manifest_naming(os.path.join(tmp, "aofdir"), "log.aof", "lime.1.incr.aof")
+    always = ("--dir", tmp, "--appendonly", "yes", "--appenddirname", "aofdir",
+              "--appendfilename", "log.aof", "--appendfsync", "always")
+
+    print("== stage test: only writes are logged, not reads")
+    with running_server(*always):
+        command(OK, "SET", "foo", "1")
+        command(b"$1\r\n1\r\n", "GET", "foo")
+        command(b"+PONG\r\n", "PING")
+        command(b"$5\r\nhello\r\n", "ECHO", "hello")
+        command(encode("appendfsync", "always"), "CONFIG", "GET", "appendfsync")
+        command(OK, "SET", "bar", "2")
+        file_is(incr, encode("SET", "foo", "1") + encode("SET", "bar", "2"), "the AOF holds just the SETs")
+
+        print("== nor other reads, failed writes, or writes that change nothing")
+        command(b":1\r\n", "RPUSH", "list", "a")
+        command(OK, "SET", "text", "abc")
+        logged = read(incr)
+        command(encode("list"), "KEYS", "l*")
+        command(b"+list\r\n", "TYPE", "list")
+        command(b":1\r\n", "LLEN", "list")
+        command(encode("a"), "LRANGE", "list", "0", "-1")
+        command(b"*0\r\n", "XRANGE", "stream", "-", "+")
+        command(b"-ERR value is not an integer or out of range\r\n", "INCR", "text")
+        command(WRONGTYPE, "RPUSH", "text", "x")
+        command(b":0\r\n", "DEL", "missing")
+        command(b"$-1\r\n", "LPOP", "missing")
+        command(b"*-1\r\n", "BLPOP", "missing", "0.1")
+        command(b"-ERR unknown command 'BOGUS'\r\n", "BOGUS")
+        discarded = Client()
+        for args, reply in [(("MULTI",), OK), (("SET", "x", "1"), QUEUED), (("DISCARD",), OK)]:
+            run(discarded, reply, *args)
+        discarded.close()
+        file_is(incr, logged, "none of them is in the AOF")
 
 with tempfile.TemporaryDirectory() as tmp:
     aof_args = ("--dir", tmp, "--appendonly", "yes", "--appenddirname", "appendonlydir",
