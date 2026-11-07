@@ -23,6 +23,17 @@ echo "== one bad location stops the whole GEOADD"
 check '-ERR invalid longitude,latitude pair 0.000000,90.000000\r\n' GEOADD edges 1 1 e 0 90 f
 check ':4\r\n' ZCARD edges
 
+echo "== stage test: a location is stored in a sorted set"
+check ':1\r\n' GEOADD stored 2.2944692 48.8584625 Paris
+check "$(array Paris)" ZRANGE stored 0 -1
+check ':1\r\n' ZCARD stored
+
+echo "== locations and ZADD members mix in the same sorted set"
+check ':1\r\n' ZADD stored 1 plain
+check "$(array plain Paris)" ZRANGE stored 0 -1
+check ':1\r\n' ZREM stored Paris
+check "$(array plain)" ZRANGE stored 0 -1
+
 echo "== arity and syntax"
 check "-ERR wrong number of arguments for 'geoadd' command\\r\\n" GEOADD places 1 2
 check '-ERR syntax error. Try GEOADD key [x1] [y1] [name1] [x2] [y2] [name2] ... \r\n' GEOADD places 1 2 a 3

@@ -204,6 +204,7 @@ with tempfile.TemporaryDirectory() as tmp:
         stream_id = xadd.read(64, 0.3).split(b"\r\n")[1].decode()
         xadd.close()
         command(b":1\r\n", "DEL", "bar")
+        command(b":1\r\n", "GEOADD", "places", "2.2944692", "48.8584625", "Paris")
         transaction = Client()
         for args, reply in [(("MULTI",), OK), (("SET", "t", "1"), QUEUED), (("INCR", "t"), QUEUED),
                             (("EXEC",), b"*2\r\n+OK\r\n:2\r\n")]:
@@ -214,6 +215,8 @@ with tempfile.TemporaryDirectory() as tmp:
             ["RPUSH", "list", "a", "b"], ["LPUSH", "list", "c"], ["LPOP", "list"],
             # BLPOP as LPOP, and XADD with the ID it generated.
             ["LPOP", "list"], ["XADD", "stream", stream_id, "f", "v"], ["DEL", "bar"],
+            # GEOADD as the ZADD it amounts to, as Redis logs it.
+            ["ZADD", "places", "3663832614298053", "Paris"],
             ["SET", "t", "1"], ["INCR", "t"],
         ]
         got = commands_in(read(incr))
