@@ -20,8 +20,22 @@ check ':0\r\n' GETBIT new_key 2
 echo "== bits past the end of the string are 0"
 check ':0\r\n' GETBIT bit_key 8
 check ':0\r\n' GETBIT bit_key 4294967295
-check ':0\r\n' SETBIT bit_key 2 0
+check ':1\r\n' SETBIT bit_key 2 0
 check ':0\r\n' GETBIT bit_key 2
+
+echo "== stage test: GETBIT reads a string set with SET, A being 01000001"
+check '+OK\r\n' SET mykey A
+check ':1\r\n' GETBIT mykey 1
+check ':1\r\n' GETBIT mykey 7
+check ':0\r\n' GETBIT mykey 0
+check ':0\r\n' GETBIT mykey 2
+
+echo "== SETBIT changes a string set with SET, keeping its expiry"
+check '+OK\r\n' SET ttl A PX 300
+check ':0\r\n' SETBIT ttl 6 1
+check '$1\r\nC\r\n' GET ttl
+sleep 0.4
+check '$-1\r\n' GET ttl
 
 echo "== errors"
 check "$offset_error" GETBIT bit_key -1
