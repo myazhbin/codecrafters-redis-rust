@@ -8,6 +8,7 @@ mod geo;
 mod glob;
 mod rdb;
 mod resp;
+mod sha256;
 mod zset;
 
 use anyhow::{Context, Result, bail};
@@ -1349,6 +1350,13 @@ fn run_command(db: &mut Store, command: &[Vec<u8>]) -> Value {
                         None => Value::NullBulkString,
                     },
                     _ => wrong_arity("acl|getuser"),
+                },
+                b"SETUSER" => match rest {
+                    [name, rules @ ..] => match db.users.set_user(name, rules) {
+                        Ok(()) => Value::SimpleString("OK".into()),
+                        Err(msg) => Value::Error(msg),
+                    },
+                    _ => wrong_arity("acl|setuser"),
                 },
                 _ => Value::Error(format!(
                     "ERR unknown subcommand '{}'. Try ACL HELP.",
