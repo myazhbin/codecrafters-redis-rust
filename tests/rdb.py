@@ -150,6 +150,11 @@ with tempfile.TemporaryDirectory() as tmp:
         unordered([key for key, _ in fruits], "KEYS", "*")
         unordered(["mango", "grape"], "KEYS", "*g*")
 
+        print("== stage test: GET reads each key's value")
+        for key, value in fruits:
+            command(bulk(value), "GET", key)
+        command(NULL, "GET", "cherry")
+
     print("== only keys in database 0 are loaded, as there's no SELECT")
     two_dbs = rdb_file(("in-db-0", "a")).replace(
         b"\xff" + b"\x00" * 8, b"\xfe\x01\x00" + string("in-db-1") + string("b") + b"\xff" + b"\x00" * 8)
