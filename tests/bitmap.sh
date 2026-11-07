@@ -30,6 +30,16 @@ check ':1\r\n' GETBIT mykey 7
 check ':0\r\n' GETBIT mykey 0
 check ':0\r\n' GETBIT mykey 2
 
+echo "== stage test: GET reads a bitmap as a string, 01000000 being @"
+check ':0\r\n' SETBIT at_key 1 1
+check '$1\r\n@\r\n' GET at_key
+
+echo "== spelling out \"Hi\" (01001000 01101001) a bit at a time"
+for offset in 1 4 9 10 12 15; do
+  check ':0\r\n' SETBIT hi "$offset" 1
+done
+check '$2\r\nHi\r\n' GET hi
+
 echo "== SETBIT changes a string set with SET, keeping its expiry"
 check '+OK\r\n' SET ttl A PX 300
 check ':0\r\n' SETBIT ttl 6 1
