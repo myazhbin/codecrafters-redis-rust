@@ -6,9 +6,17 @@ import os
 import tempfile
 from contextlib import contextmanager
 
-from helpers import OK, Client, command, encode, check, finish, running_server
+from helpers import OK, Client, bulk, command, encode, check, finish, running_server
 
 ARITY = b"-ERR wrong number of arguments for '%s' command\r\n"
+NULL = b"$-1\r\n"
+
+
+class Raw:
+    """A value already in an RDB string encoding, such as an integer one."""
+
+    def __init__(self, data):
+        self.data = data
 
 
 def length(n):
@@ -22,6 +30,8 @@ def length(n):
 
 def string(text):
     """A string-encoded value: its length, then the bytes."""
+    if isinstance(text, Raw):
+        return text.data
     data = text.encode() if isinstance(text, str) else text
     return length(len(data)) + data
 
@@ -105,6 +115,34 @@ with tempfile.TemporaryDirectory() as tmp:
         command(OK, "SET", "bar", "1")
         unordered(["foo", "bar"], "KEYS", "*")
         command(encode("bar"), "KEYS", "b*")
+
+    print("== stage test: GET reads the value from the RDB file")
+    with server_with_rdb(tmp, rdb_file(("foo", "bar"))):
+        command(bulk("bar"), "GET", "foo")
+        command(NULL, "GET", "missing")
+
+    print("== values stored as integers, a long value, and keys that are integers")
+    long_value = "v" * 700
+    with server_with_rdb(tmp, rdb_file(
+        ("int8", Raw(b"\xc0\x7b")),
+        ("int16", Raw(b"\xc1\x39\x30")),
+        ("int32", Raw(b"\xc2\x87\xd6\x12\x00")),
+        ("negative", Raw(b"\xc0\xff")),
+        ("long", long_value),
+        (Raw(b"\xc0\x2a"), "the key is 42"),
+    )):
+        command(bulk("123"), "GET", "int8")
+        command(bulk("12345"), "GET", "int16")
+        command(bulk("1234567"), "GET", "int32")
+        command(bulk("-1"), "GET", "negative")
+        command(bulk(long_value), "GET", "long")
+        command(bulk("the key is 42"), "GET", "42")
+
+        print("== loaded values are ordinary strings")
+        command(b":124\r\n", "INCR", "int8")
+        command(b"+string\r\n", "TYPE", "long")
+        command(OK, "SET", "int16", "replaced")
+        command(bulk("replaced"), "GET", "int16")
 
     print("== an RDB file that doesn't exist means an empty database")
     with running_server("--dir", tmp, "--dbfilename", "nosuchfile.rdb"):
