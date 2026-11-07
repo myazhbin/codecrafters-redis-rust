@@ -44,6 +44,7 @@ script_tests! {
     replication: "replication.py",
     rdb: "rdb.py",
     aof: "aof.py",
+    del: "del.sh",
 }
 
 /// Runs tests/<script>, failing if it reports a failure, with the script's output shown.

@@ -630,6 +630,7 @@ fn propagate_write(db: &mut Store, command: &[Vec<u8>], reply: &Value) {
         (_, Value::Error(_)) => {}
         (b"SET" | b"RPUSH" | b"LPUSH" | b"INCR", _) => db.propagate(command),
         (b"LPOP", Value::BulkString(_)) => db.propagate(command),
+        (b"DEL", Value::Integer(removed)) if *removed > 0 => db.propagate(command),
         (b"LPOP", Value::Array(popped)) if !popped.is_empty() => db.propagate(command),
         // With the ID spelled out, because a replica would generate a different one.
         (b"XADD", Value::BulkString(id)) => {
@@ -775,6 +776,21 @@ fn run_command(db: &mut Store, command: &[Vec<u8>]) -> Value {
         b"KEYS" => match args {
             [pattern] => matching_keys(db, pattern),
             _ => wrong_arity("keys"),
+        },
+        b"DEL" => match args {
+            [] => wrong_arity("del"),
+            keys => {
+                let mut removed = 0;
+                for key in keys {
+                    // A key that has expired counts as already gone.
+                    remove_if_expired(db, key);
+                    if db.entries.remove(key).is_some() {
+                        db.touch(key);
+                        removed += 1;
+                    }
+                }
+                Value::Integer(removed)
+            }
         },
         // `handle_request` handles UNWATCH outside a transaction. Inside one, it's left
         // with nothing to do: EXEC has already stopped watching by the time it runs.

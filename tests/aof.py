@@ -8,8 +8,8 @@ import sys
 import tempfile
 import time
 
-from helpers import (DEFAULT_BINARY, OK, OTHER_PORT, check, command, encode, finish,
-                     running_server)
+from helpers import (DEFAULT_BINARY, OK, OTHER_PORT, QUEUED, Client, check, command, encode,
+                     finish, run, running_server)
 
 BINARY = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_BINARY
 
@@ -174,6 +174,43 @@ with tempfile.TemporaryDirectory() as tmp:
         command(OK, "SET", "gone", "3", "PXAT", "1000")
         command(b"$-1\r\n", "GET", "gone")
         command(b"-ERR invalid expire time in 'set' command\r\n", "SET", "c", "4", "PXAT", "0")
+
+with tempfile.TemporaryDirectory() as tmp:
+    incr = manifest_naming(os.path.join(tmp, "aofdir"), "log.aof", "kiwi.1.incr.aof")
+    always = ("--dir", tmp, "--appendonly", "yes", "--appenddirname", "aofdir",
+              "--appendfilename", "log.aof", "--appendfsync", "always")
+
+    print("== stage test: several writes are appended in the order they came")
+    with running_server(*always):
+        command(OK, "SET", "foo", "100")
+        command(OK, "SET", "bar", "200")
+        file_is(incr, encode("SET", "foo", "100") + encode("SET", "bar", "200"), "both SETs, in order")
+
+        print("== every kind of write is logged, as replicas get it")
+        command(b":101\r\n", "INCR", "foo")
+        command(b":2\r\n", "RPUSH", "list", "a", "b")
+        command(b":3\r\n", "LPUSH", "list", "c")
+        command(b"$1\r\nc\r\n", "LPOP", "list")
+        command(encode("list", "a"), "BLPOP", "list", "0")
+        xadd = Client()
+        xadd.send("XADD", "stream", "*", "f", "v")
+        stream_id = xadd.read(64, 0.3).split(b"\r\n")[1].decode()
+        xadd.close()
+        command(b":1\r\n", "DEL", "bar")
+        transaction = Client()
+        for args, reply in [(("MULTI",), OK), (("SET", "t", "1"), QUEUED), (("INCR", "t"), QUEUED),
+                            (("EXEC",), b"*2\r\n+OK\r\n:2\r\n")]:
+            run(transaction, reply, *args)
+        transaction.close()
+        want = [
+            ["SET", "foo", "100"], ["SET", "bar", "200"], ["INCR", "foo"],
+            ["RPUSH", "list", "a", "b"], ["LPUSH", "list", "c"], ["LPOP", "list"],
+            # BLPOP as LPOP, and XADD with the ID it generated.
+            ["LPOP", "list"], ["XADD", "stream", stream_id, "f", "v"], ["DEL", "bar"],
+            ["SET", "t", "1"], ["INCR", "t"],
+        ]
+        got = commands_in(read(incr))
+        check("the AOF holds all the writes, in order", got == want, f"want {want}, got {got}")
 
 with tempfile.TemporaryDirectory() as tmp:
     aof_args = ("--dir", tmp, "--appendonly", "yes", "--appenddirname", "appendonlydir",
