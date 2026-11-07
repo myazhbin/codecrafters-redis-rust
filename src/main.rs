@@ -1,5 +1,6 @@
 #![allow(unused_imports)]
 
+mod aof;
 mod config;
 mod glob;
 mod rdb;
@@ -205,13 +206,21 @@ async fn main() {
         eprintln!("{msg}");
         std::process::exit(1);
     });
-    let listener = TcpListener::bind(("127.0.0.1", config.port)).await.unwrap();
     let db = Db::new(Mutex::new(Store {
         is_replica: config.replicaof.is_some(),
         config: config.clone(),
         ..Store::default()
     }));
+    // The data and the AOF's files are ready before the server starts listening, so that a
+    // client can't get in first.
+    if config.appendonly {
+        if let Err(e) = aof::set_up(&config) {
+            eprintln!("{e:#}");
+            std::process::exit(1);
+        }
+    }
     load_rdb_file(&mut db.lock().unwrap(), &config);
+    let listener = TcpListener::bind(("127.0.0.1", config.port)).await.unwrap();
 
     if let Some((host, master_port)) = config.replicaof {
         let db = db.clone();
