@@ -1,5 +1,6 @@
 #![allow(unused_imports)]
 
+mod acl;
 mod aof;
 mod bitmap;
 mod config;
@@ -58,6 +59,8 @@ struct Store {
     /// The clients subscribed to each Pub/Sub channel, by client ID, with where to send
     /// them the messages published to it.
     channels: HashMap<Vec<u8>, HashMap<u64, mpsc::UnboundedSender<Vec<u8>>>>,
+    /// The users clients can log in as.
+    users: acl::Users,
 }
 
 impl Store {
@@ -477,6 +480,8 @@ struct Session {
     subscriptions: Vec<Vec<u8>>,
     /// Where messages published to those channels arrive, once the client has subscribed.
     inbox: Option<Inbox>,
+    /// The user the client is logged in as, if any.
+    user: Option<Vec<u8>>,
 }
 
 /// Where the messages published to a client's channels arrive, ready to send it.
@@ -500,7 +505,11 @@ impl Inbox {
 }
 
 async fn handle_connection(stream: TcpStream, db: Db) -> Result<()> {
-    let mut session = Session::default();
+    let user = db.lock().unwrap().users.new_connection_user();
+    let mut session = Session {
+        user,
+        ..Session::default()
+    };
     let result = serve_client(stream, &db, &mut session).await;
     // A client that hangs up is no longer subscribed to anything.
     let mut db = db.lock().unwrap();
@@ -822,6 +831,16 @@ async fn handle_request(request: Value, db: &Db, session: &mut Session) -> Value
             session.replica = Some((db.add_replica(sender), receiver));
             // A full resync is all there is, whatever the replica asks for.
             Value::SimpleString(format!("FULLRESYNC {REPLICATION_ID} {}", db.repl_offset))
+        }
+        // The other ACL subcommands go through `run_command`, but WHOAMI needs the session.
+        Some(b"ACL") if command.get(1).is_some_and(|sub| sub.eq_ignore_ascii_case(b"WHOAMI")) => {
+            if command.len() != 2 {
+                return wrong_arity("acl|whoami");
+            }
+            match &session.user {
+                Some(user) => Value::BulkString(user.clone()),
+                None => Value::Error("NOAUTH Authentication required.".into()),
+            }
         }
         Some(b"MULTI") => wrong_arity("multi"),
         Some(b"EXEC") => wrong_arity("exec"),
@@ -1308,6 +1327,13 @@ fn run_command(db: &mut Store, command: &[Vec<u8>]) -> Value {
             _ => wrong_arity("unwatch"),
         },
         b"INFO" => info(db, args),
+        b"ACL" => match args.first() {
+            None => wrong_arity("acl"),
+            Some(subcommand) => Value::Error(format!(
+                "ERR unknown subcommand '{}'. Try ACL HELP.",
+                String::from_utf8_lossy(subcommand)
+            )),
+        },
         b"CONFIG" => config_command(&db.config, args),
         // Nothing uses what a replica says about itself in the handshake. The REPLCONFs that
         // do matter, ACK and GETACK, are dealt with on the replication connection.

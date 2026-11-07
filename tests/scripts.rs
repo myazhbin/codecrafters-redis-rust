@@ -49,6 +49,7 @@ script_tests! {
     zset: "zset.sh",
     bitmap: "bitmap.sh",
     geo: "geo.sh",
+    auth: "auth.py",
 }
 
 /// Runs tests/<script>, failing if it reports a failure, with the script's output shown.
