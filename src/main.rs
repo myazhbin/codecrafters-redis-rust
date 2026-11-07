@@ -1,6 +1,7 @@
 #![allow(unused_imports)]
 
 mod aof;
+mod bitmap;
 mod config;
 mod glob;
 mod rdb;
@@ -883,7 +884,7 @@ fn propagate_write(db: &mut Store, command: &[Vec<u8>], reply: &Value) {
         (b"SET" | b"RPUSH" | b"LPUSH" | b"INCR", _) => db.propagate(command),
         (b"LPOP", Value::BulkString(_)) => db.propagate(command),
         (b"DEL", Value::Integer(removed)) if *removed > 0 => db.propagate(command),
-        (b"ZADD", Value::Integer(_)) => db.propagate(command),
+        (b"ZADD" | b"SETBIT", Value::Integer(_)) => db.propagate(command),
         (b"ZREM", Value::Integer(removed)) if *removed > 0 => db.propagate(command),
         (b"LPOP", Value::Array(popped)) if !popped.is_empty() => db.propagate(command),
         // With the ID spelled out, because a replica would generate a different one.
@@ -1044,6 +1045,26 @@ fn run_command(db: &mut Store, command: &[Vec<u8>]) -> Value {
         b"PUBLISH" => match args {
             [channel, message] => publish(db, channel, message),
             _ => wrong_arity("publish"),
+        },
+        b"SETBIT" => match args {
+            [key, offset, bit] => {
+                let Some(offset) = bitmap::parse_offset(offset) else {
+                    return Value::Error("ERR bit offset is not an integer or out of range".into());
+                };
+                let on = match parse_number::<i64>(bit) {
+                    Some(0) => false,
+                    Some(1) => true,
+                    _ => return Value::Error("ERR bit is not an integer or out of range".into()),
+                };
+                let new = Data::String(Vec::new());
+                let Data::String(bytes) = live_value_or_insert(db, key, new) else {
+                    return wrong_type();
+                };
+                let was_on = bitmap::set_bit(bytes, offset, on);
+                db.touch(key);
+                Value::Integer(i64::from(was_on))
+            }
+            _ => wrong_arity("setbit"),
         },
         b"ZADD" => match args {
             [_, _, _, ..] if args.len() % 2 == 0 => {

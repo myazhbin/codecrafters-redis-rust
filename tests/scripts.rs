@@ -47,6 +47,7 @@ script_tests! {
     del: "del.sh",
     pubsub: "pubsub.py",
     zset: "zset.sh",
+    bitmap: "bitmap.sh",
 }
 
 /// Runs tests/<script>, failing if it reports a failure, with the script's output shown.
