@@ -1051,6 +1051,30 @@ fn run_command(db: &mut Store, command: &[Vec<u8>]) -> Value {
             [key, pairs @ ..] if pairs.len() >= 2 => zadd(db, key, pairs),
             _ => wrong_arity("zadd"),
         },
+        b"ZRANK" => match args {
+            [key, member] => match live_value(db, key) {
+                Some(Data::SortedSet(set)) => set
+                    .rank(member)
+                    .map_or(Value::NullBulkString, |rank| Value::Integer(rank as i64)),
+                Some(_) => wrong_type(),
+                None => Value::NullBulkString,
+            },
+            [key, member, option] if option.eq_ignore_ascii_case(b"WITHSCORE") => {
+                match live_value(db, key) {
+                    Some(Data::SortedSet(set)) => match (set.rank(member), set.score(member)) {
+                        (Some(rank), Some(score)) => Value::Array(vec![
+                            Value::Integer(rank as i64),
+                            Value::BulkString(zset::format_score(score).into_bytes()),
+                        ]),
+                        _ => Value::NullArray,
+                    },
+                    Some(_) => wrong_type(),
+                    None => Value::NullArray,
+                }
+            }
+            [_, _, _] => Value::Error("ERR syntax error".into()),
+            _ => wrong_arity("zrank"),
+        },
         b"KEYS" => match args {
             [pattern] => matching_keys(db, pattern),
             _ => wrong_arity("keys"),

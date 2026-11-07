@@ -24,6 +24,34 @@ check ':0\r\n' ZADD added 30.1 zset_member2
 echo "== new and existing members in one ZADD; only the new ones count"
 check ':2\r\n' ZADD added 1 zset_member1 2 new1 3 new2 4 zset_member3
 
+echo "== stage test: ZRANK gives a member's rank, by score and then by name"
+check ':1\r\n' ZADD ranked 100.0 foo
+check ':1\r\n' ZADD ranked 100.0 bar
+check ':1\r\n' ZADD ranked 20.0 baz
+check ':1\r\n' ZADD ranked 30.1 caz
+check ':1\r\n' ZADD ranked 40.2 paz
+check ':1\r\n' ZRANK ranked caz
+check ':0\r\n' ZRANK ranked baz
+check ':4\r\n' ZRANK ranked foo
+check ':3\r\n' ZRANK ranked bar
+check ':2\r\n' ZRANK ranked paz
+check '$-1\r\n' ZRANK ranked missing_member
+check '$-1\r\n' ZRANK missing_key member
+
+echo "== an updated score changes the rank"
+check ':0\r\n' ZADD ranked 1 foo
+check ':0\r\n' ZRANK ranked foo
+check ':1\r\n' ZRANK ranked baz
+
+echo "== ZRANK WITHSCORE, errors"
+check '*2\r\n:1\r\n$2\r\n20\r\n' ZRANK ranked baz WITHSCORE
+check '*2\r\n:3\r\n$4\r\n40.2\r\n' ZRANK ranked paz withscore
+check '*-1\r\n' ZRANK ranked missing WITHSCORE
+check '-ERR syntax error\r\n' ZRANK ranked baz BOGUS
+check '+OK\r\n' SET a-string v
+check "$wrongtype" ZRANK a-string member
+check "-ERR wrong number of arguments for 'zrank' command\\r\\n" ZRANK ranked
+
 echo "== errors, which leave nothing behind"
 check '-ERR value is not a valid float\r\n' ZADD added 1 new3 x new4
 check '-ERR value is not a valid float\r\n' ZADD bad abc member
