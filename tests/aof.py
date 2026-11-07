@@ -285,6 +285,25 @@ with tempfile.TemporaryDirectory() as tmp:
         command(bulk("x"), "GET", "from-rdb")
         command(NULL, "GET", "foo")
 
+    print("== stage test: every command in the file is replayed, in order")
+    keys = {"apple": "red", "banana": "yellow", "grape": "purple", "lime": "green"}
+    write(incr, b"".join(encode("SET", key, value) for key, value in keys.items()))
+    with running_server(*args):
+        for key, value in keys.items():
+            command(bulk(value), "GET", key)
+
+    print("== later commands build on earlier ones")
+    write(incr, encode("SET", "n", "10") + encode("INCR", "n") + encode("INCR", "n")
+          + encode("RPUSH", "list", "a", "b", "c") + encode("LPOP", "list") + encode("LPUSH", "list", "z")
+          + encode("SET", "gone", "1") + encode("DEL", "gone") + encode("SET", "apple", "first")
+          + encode("SET", "apple", "second") + encode("XADD", "stream", "1-1", "f", "v"))
+    with running_server(*args):
+        command(bulk("12"), "GET", "n")
+        command(encode("z", "b", "c"), "LRANGE", "list", "0", "-1")
+        command(NULL, "GET", "gone")
+        command(bulk("second"), "GET", "apple")
+        command(b"*1\r\n" + b"*2\r\n" + bulk("1-1") + encode("f", "v"), "XRANGE", "stream", "-", "+")
+
     print("== a file that ends partway through a command is cut off there")
     write(incr, encode("SET", "a", "1") + encode("SET", "b", "2")[:-3])
     with running_server(*args):
