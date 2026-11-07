@@ -884,6 +884,7 @@ fn propagate_write(db: &mut Store, command: &[Vec<u8>], reply: &Value) {
         (b"LPOP", Value::BulkString(_)) => db.propagate(command),
         (b"DEL", Value::Integer(removed)) if *removed > 0 => db.propagate(command),
         (b"ZADD", Value::Integer(_)) => db.propagate(command),
+        (b"ZREM", Value::Integer(removed)) if *removed > 0 => db.propagate(command),
         (b"LPOP", Value::Array(popped)) if !popped.is_empty() => db.propagate(command),
         // With the ID spelled out, because a replica would generate a different one.
         (b"XADD", Value::BulkString(id)) => {
@@ -1088,6 +1089,25 @@ fn run_command(db: &mut Store, command: &[Vec<u8>]) -> Value {
                 None => Value::NullBulkString,
             },
             _ => wrong_arity("zscore"),
+        },
+        b"ZREM" => match args {
+            [key, members @ ..] if !members.is_empty() => {
+                let set = match live_value(db, key) {
+                    Some(Data::SortedSet(set)) => set,
+                    Some(_) => return wrong_type(),
+                    None => return Value::Integer(0),
+                };
+                let removed = members.iter().filter(|member| set.remove(member)).count();
+                // Redis deletes a sorted set along with its last member.
+                if set.is_empty() {
+                    db.entries.remove(key);
+                }
+                if removed > 0 {
+                    db.touch(key);
+                }
+                Value::Integer(removed as i64)
+            }
+            _ => wrong_arity("zrem"),
         },
         b"ZCARD" => match args {
             [key] => match live_value(db, key) {

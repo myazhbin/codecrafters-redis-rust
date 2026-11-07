@@ -296,13 +296,15 @@ with tempfile.TemporaryDirectory() as tmp:
     write(incr, encode("SET", "n", "10") + encode("INCR", "n") + encode("INCR", "n")
           + encode("RPUSH", "list", "a", "b", "c") + encode("LPOP", "list") + encode("LPUSH", "list", "z")
           + encode("SET", "gone", "1") + encode("DEL", "gone") + encode("SET", "apple", "first")
-          + encode("SET", "apple", "second") + encode("XADD", "stream", "1-1", "f", "v"))
+          + encode("SET", "apple", "second") + encode("XADD", "stream", "1-1", "f", "v")
+          + encode("ZADD", "zset", "1", "a", "2", "b") + encode("ZREM", "zset", "a"))
     with running_server(*args):
         command(bulk("12"), "GET", "n")
         command(encode("z", "b", "c"), "LRANGE", "list", "0", "-1")
         command(NULL, "GET", "gone")
         command(bulk("second"), "GET", "apple")
         command(b"*1\r\n" + b"*2\r\n" + bulk("1-1") + encode("f", "v"), "XRANGE", "stream", "-", "+")
+        command(encode("b"), "ZRANGE", "zset", "0", "-1")
 
     print("== a file that ends partway through a command is cut off there")
     write(incr, encode("SET", "a", "1") + encode("SET", "b", "2")[:-3])

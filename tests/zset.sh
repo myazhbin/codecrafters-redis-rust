@@ -128,6 +128,31 @@ check '$5\r\n1e+30\r\n' ZSCORE scored big
 check "$wrongtype" ZSCORE a-string member
 check "-ERR wrong number of arguments for 'zscore' command\\r\\n" ZSCORE scored
 
+echo "== stage test: ZREM removes a member"
+check ':1\r\n' ZADD removing 80.5 foo
+check ':1\r\n' ZADD removing 50.3 baz
+check ':1\r\n' ZADD removing 80.5 bar
+check ':1\r\n' ZREM removing baz
+check "$(array bar foo)" ZRANGE removing 0 -1
+check ':0\r\n' ZREM removing missing_member
+check ':2\r\n' ZCARD removing
+
+echo "== several members at once, and the set goes with its last member"
+check ':1\r\n' ZREM removing foo nope foo
+check '$-1\r\n' ZSCORE removing foo
+check ':1\r\n' ZREM removing bar
+check '+none\r\n' TYPE removing
+check '*0\r\n' KEYS removing
+check ':0\r\n' ZREM removing bar
+check ':0\r\n' ZREM missing_key member
+check "$wrongtype" ZREM a-string member
+check "-ERR wrong number of arguments for 'zrem' command\\r\\n" ZREM removing
+
+echo "== a sorted set is a value like any other"
+check ':2\r\n' ZADD deleted 1 a 2 b
+check ':1\r\n' DEL deleted
+check ':0\r\n' ZCARD deleted
+
 echo "== errors, which leave nothing behind"
 check '-ERR value is not a valid float\r\n' ZADD added 1 new3 x new4
 check '-ERR value is not a valid float\r\n' ZADD bad abc member
