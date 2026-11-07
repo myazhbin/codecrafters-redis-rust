@@ -4,6 +4,7 @@ is, and loading the keys in it at startup."""
 
 import os
 import tempfile
+import time
 from contextlib import contextmanager
 
 from helpers import OK, Client, bulk, command, encode, check, finish, running_server
@@ -48,6 +49,16 @@ def rdb_file(*keys):
         out += b"".join(expiry) + b"\x00" + string(key) + string(value)
     # The end of the file, then a checksum, which the server doesn't check.
     return out + b"\xff" + b"\x00" * 8
+
+
+def expires_ms(unix_ms):
+    """An expiry in milliseconds, for the key after it."""
+    return b"\xfc" + unix_ms.to_bytes(8, "little")
+
+
+def expires_s(unix_s):
+    """An expiry in seconds, for the key after it."""
+    return b"\xfd" + unix_s.to_bytes(4, "little")
 
 
 @contextmanager
@@ -154,6 +165,30 @@ with tempfile.TemporaryDirectory() as tmp:
         for key, value in fruits:
             command(bulk(value), "GET", key)
         command(NULL, "GET", "cherry")
+
+    print("== stage test: keys with expiries, in the past and in the future")
+    now_ms = int(time.time() * 1000)
+    day_ms = 24 * 3600 * 1000
+    with server_with_rdb(tmp, rdb_file(
+        ("no-expiry", "a"),
+        ("expired-ms", "b", expires_ms(now_ms - day_ms)),
+        ("future-ms", "c", expires_ms(now_ms + day_ms)),
+        ("expired-s", "d", expires_s(now_ms // 1000 - 3600)),
+        ("future-s", "e", expires_s(now_ms // 1000 + 3600)),
+        ("soon", "f", expires_ms(now_ms + 1500)),
+    )):
+        command(bulk("a"), "GET", "no-expiry")
+        command(NULL, "GET", "expired-ms")
+        command(bulk("c"), "GET", "future-ms")
+        command(NULL, "GET", "expired-s")
+        command(bulk("e"), "GET", "future-s")
+        unordered(["no-expiry", "future-ms", "future-s", "soon"], "KEYS", "*")
+
+        print("== a key loaded with an expiry still expires on time")
+        command(bulk("f"), "GET", "soon")
+        time.sleep(max(0, (now_ms + 1600) / 1000 - time.time()))
+        command(NULL, "GET", "soon")
+        unordered(["no-expiry", "future-ms", "future-s"], "KEYS", "*")
 
     print("== only keys in database 0 are loaded, as there's no SELECT")
     two_dbs = rdb_file(("in-db-0", "a")).replace(
