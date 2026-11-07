@@ -103,6 +103,19 @@ check ':0\r\n' GETBIT dest 4
 check ':0\r\n' GETBIT dest 6
 check ':1\r\n' BITCOUNT dest
 
+echo "== stage test: shorter sources count as padded with zeros"
+check ':0\r\n' SETBIT long1 1 1
+check ':0\r\n' SETBIT long1 10 1
+check ':0\r\n' SETBIT short2 1 1
+check ':2\r\n' BITOP AND dest2 long1 short2
+check ':1\r\n' GETBIT dest2 1
+check ':0\r\n' GETBIT dest2 10
+check ':2\r\n' STRLEN dest2
+check ':2\r\n' BITOP AND dest3 short2 long1
+check ':1\r\n' BITCOUNT dest3
+check ':2\r\n' BITOP AND dest4 long1 missing
+check ':0\r\n' BITCOUNT dest4
+
 echo "== the result replaces what was at the destination, expiry and all"
 check '+OK\r\n' SET old-dest something PX 200
 check ':1\r\n' BITOP and old-dest key1 key2
