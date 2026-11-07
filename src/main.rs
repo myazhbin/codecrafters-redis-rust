@@ -1079,6 +1079,14 @@ fn run_command(db: &mut Store, command: &[Vec<u8>]) -> Value {
             }
             _ => wrong_arity("zrange"),
         },
+        b"ZCARD" => match args {
+            [key] => match live_value(db, key) {
+                Some(Data::SortedSet(set)) => Value::Integer(set.len() as i64),
+                Some(_) => wrong_type(),
+                None => Value::Integer(0),
+            },
+            _ => wrong_arity("zcard"),
+        },
         b"ZRANK" => match args {
             [key, member] => match live_value(db, key) {
                 Some(Data::SortedSet(set)) => set

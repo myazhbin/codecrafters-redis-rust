@@ -94,6 +94,18 @@ check '-ERR value is not an integer or out of range\r\n' ZRANGE listed a 1
 check "$wrongtype" ZRANGE a-string 0 1
 check "-ERR wrong number of arguments for 'zrange' command\\r\\n" ZRANGE listed 0
 
+echo "== stage test: ZCARD counts the members"
+check ':1\r\n' ZADD counted 20.0 zset_member1
+check ':1\r\n' ZADD counted 30.1 zset_member2
+check ':1\r\n' ZADD counted 40.2 zset_member3
+check ':1\r\n' ZADD counted 50.3 zset_member4
+check ':4\r\n' ZCARD counted
+check ':0\r\n' ZADD counted 100.0 zset_member1
+check ':4\r\n' ZCARD counted
+check ':0\r\n' ZCARD missing_key
+check "$wrongtype" ZCARD a-string
+check "-ERR wrong number of arguments for 'zcard' command\\r\\n" ZCARD
+
 echo "== errors, which leave nothing behind"
 check '-ERR value is not a valid float\r\n' ZADD added 1 new3 x new4
 check '-ERR value is not a valid float\r\n' ZADD bad abc member
