@@ -3,6 +3,7 @@
 mod aof;
 mod bitmap;
 mod config;
+mod geo;
 mod glob;
 mod rdb;
 mod resp;
@@ -885,6 +886,7 @@ fn propagate_write(db: &mut Store, command: &[Vec<u8>], reply: &Value) {
         (b"LPOP", Value::BulkString(_)) => db.propagate(command),
         (b"DEL", Value::Integer(removed)) if *removed > 0 => db.propagate(command),
         (b"ZADD" | b"SETBIT" | b"BITOP", Value::Integer(_)) => db.propagate(command),
+        (b"GEOADD", Value::Integer(_)) => db.propagate(&geoadd_as_zadd(command)),
         (b"ZREM", Value::Integer(removed)) if *removed > 0 => db.propagate(command),
         (b"LPOP", Value::Array(popped)) if !popped.is_empty() => db.propagate(command),
         // With the ID spelled out, because a replica would generate a different one.
@@ -1122,6 +1124,15 @@ fn run_command(db: &mut Store, command: &[Vec<u8>]) -> Value {
                 }
             }
             _ => wrong_arity("getbit"),
+        },
+        b"GEOADD" => match args {
+            [key, locations @ ..] if locations.len() >= 3 && locations.len() % 3 == 0 => {
+                geoadd(db, key, locations)
+            }
+            [_, _, _, _, ..] => Value::Error(
+                "ERR syntax error. Try GEOADD key [x1] [y1] [name1] [x2] [y2] [name2] ... ".into(),
+            ),
+            _ => wrong_arity("geoadd"),
         },
         b"ZADD" => match args {
             [_, _, _, ..] if args.len() % 2 == 0 => {
@@ -1795,6 +1806,12 @@ fn zadd(db: &mut Store, key: &[u8], pairs: &[Vec<u8>]) -> Value {
         };
         members.push((score, &pair[1]));
     }
+    add_to_sorted_set(db, key, members)
+}
+
+/// Adds members with their scores to the sorted set at `key`, creating it if needed, and
+/// replies with how many members were new.
+fn add_to_sorted_set(db: &mut Store, key: &[u8], members: Vec<(f64, &Vec<u8>)>) -> Value {
     let new_set = Data::SortedSet(SortedSet::default());
     let Data::SortedSet(set) = live_value_or_insert(db, key, new_set) else {
         return wrong_type();
@@ -1807,6 +1824,39 @@ fn zadd(db: &mut Store, key: &[u8], pairs: &[Vec<u8>]) -> Value {
     }
     db.touch(key);
     Value::Integer(added)
+}
+
+/// GEOADD: adds each location, given as longitude, latitude and member, to the sorted set
+/// at `key`, with its geohash as its score. Replies with how many members were new.
+fn geoadd(db: &mut Store, key: &[u8], locations: &[Vec<u8>]) -> Value {
+    // Every location is checked before anything changes.
+    let mut members = Vec::new();
+    for location in locations.chunks(3) {
+        let (Some(longitude), Some(latitude)) =
+            (parse_number::<f64>(&location[0]), parse_number::<f64>(&location[1]))
+        else {
+            return Value::Error("ERR value is not a valid float".into());
+        };
+        if !geo::is_valid(longitude, latitude) {
+            return Value::Error(format!(
+                "ERR invalid longitude,latitude pair {longitude:.6},{latitude:.6}"
+            ));
+        }
+        members.push((geo::encode(longitude, latitude) as f64, &location[2]));
+    }
+    add_to_sorted_set(db, key, members)
+}
+
+/// GEOADD as Redis passes it on to replicas and the AOF: as the ZADD it amounts to.
+fn geoadd_as_zadd(command: &[Vec<u8>]) -> Vec<Vec<u8>> {
+    let mut zadd = vec![b"ZADD".to_vec(), command[1].clone()];
+    for location in command[2..].chunks(3) {
+        let longitude = parse_number::<f64>(&location[0]).unwrap_or_default();
+        let latitude = parse_number::<f64>(&location[1]).unwrap_or_default();
+        zadd.push(geo::encode(longitude, latitude).to_string().into_bytes());
+        zadd.push(location[2].clone());
+    }
+    zadd
 }
 
 /// KEYS: every key that matches `pattern`, in no particular order. Keys that have expired
