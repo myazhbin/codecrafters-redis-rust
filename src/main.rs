@@ -1066,6 +1066,14 @@ fn run_command(db: &mut Store, command: &[Vec<u8>]) -> Value {
             }
             _ => wrong_arity("setbit"),
         },
+        b"STRLEN" => match args {
+            [key] => match live_value(db, key) {
+                Some(Data::String(bytes)) => Value::Integer(bytes.len() as i64),
+                Some(_) => wrong_type(),
+                None => Value::Integer(0),
+            },
+            _ => wrong_arity("strlen"),
+        },
         b"GETBIT" => match args {
             [key, offset] => {
                 let Some(offset) = bitmap::parse_offset(offset) else {

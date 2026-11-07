@@ -40,6 +40,26 @@ for offset in 1 4 9 10 12 15; do
 done
 check '$2\r\nHi\r\n' GET hi
 
+echo "== stage test: SETBIT past the end grows the string, as STRLEN shows"
+check ':0\r\n' SETBIT grow_key 1 1
+check ':1\r\n' STRLEN grow_key
+check ':0\r\n' SETBIT grow_key 10 1
+check ':1\r\n' GETBIT grow_key 10
+check ':2\r\n' STRLEN grow_key
+check '$2\r\n@ \r\n' GET grow_key
+check ':0\r\n' SETBIT grow_key 87 0
+check ':11\r\n' STRLEN grow_key
+check ':1\r\n' SETBIT grow_key 10 0
+check ':11\r\n' STRLEN grow_key
+
+echo "== STRLEN of other keys"
+check ':0\r\n' STRLEN missing
+check '+OK\r\n' SET text hello
+check ':5\r\n' STRLEN text
+check ':1\r\n' RPUSH a-list x
+check "$wrongtype" STRLEN a-list
+check "-ERR wrong number of arguments for 'strlen' command\\r\\n" STRLEN
+
 echo "== SETBIT changes a string set with SET, keeping its expiry"
 check '+OK\r\n' SET ttl A PX 300
 check ':0\r\n' SETBIT ttl 6 1
