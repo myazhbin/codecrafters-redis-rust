@@ -1134,6 +1134,30 @@ fn run_command(db: &mut Store, command: &[Vec<u8>]) -> Value {
             ),
             _ => wrong_arity("geoadd"),
         },
+        b"GEODIST" => match args {
+            [key, from, to, unit @ ..] if unit.len() <= 1 => {
+                let to_meters = match unit {
+                    [] => 1.0,
+                    [unit] => match geo::unit_in_meters(unit) {
+                        Some(meters) => meters,
+                        None => return unsupported_unit(),
+                    },
+                    _ => unreachable!(),
+                };
+                let set = match live_value(db, key) {
+                    Some(Data::SortedSet(set)) => set,
+                    Some(_) => return wrong_type(),
+                    None => return Value::NullBulkString,
+                };
+                let (Some(from), Some(to)) = (set.score(from), set.score(to)) else {
+                    return Value::NullBulkString;
+                };
+                let meters = geo::distance(geo::decode(from as u64), geo::decode(to as u64));
+                Value::BulkString(format!("{:.4}", meters / to_meters).into_bytes())
+            }
+            [_, _, _, ..] => Value::Error("ERR syntax error".into()),
+            _ => wrong_arity("geodist"),
+        },
         b"GEOPOS" => match args {
             [key, members @ ..] => {
                 let set = match live_value(db, key) {
@@ -1869,6 +1893,10 @@ fn geoadd(db: &mut Store, key: &[u8], locations: &[Vec<u8>]) -> Value {
         members.push((geo::encode(longitude, latitude) as f64, &location[2]));
     }
     add_to_sorted_set(db, key, members)
+}
+
+fn unsupported_unit() -> Value {
+    Value::Error("ERR unsupported unit provided. please use M, KM, FT, MI".into())
 }
 
 /// GEOADD as Redis passes it on to replicas and the AOF: as the ZADD it amounts to.

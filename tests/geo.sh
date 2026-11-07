@@ -69,6 +69,27 @@ check "*1\\r\\n$(array 49.12499874830246 72.99100027813947)" GEOPOS decoded Bar
 check "*1\\r\\n$(array 10.087200701236725 34.50260034107079)" GEOPOS decoded Baz
 check "*1\\r\\n$(array 41.12499922513962 73.99100100464304)" GEOPOS decoded Caz
 
+echo "== stage test: GEODIST gives the distance between two locations, in meters"
+check ':1\r\n' GEOADD distances 11.5030378 48.164271 Munich
+check ':1\r\n' GEOADD distances 2.2944692 48.8584625 Paris
+check ':1\r\n' GEOADD distances -0.0884948 51.506479 London
+check '$11\r\n682477.7582\r\n' GEODIST distances Munich Paris
+check '$11\r\n682477.7582\r\n' GEODIST distances Paris Munich
+check '$11\r\n909560.1167\r\n' GEODIST distances London Munich
+check '$6\r\n0.0000\r\n' GEODIST distances Paris Paris
+
+echo "== other units, and what isn't there"
+check '$8\r\n682.4778\r\n' GEODIST distances Munich Paris km
+check '$8\r\n424.0731\r\n' GEODIST distances Munich Paris MI
+check '$12\r\n2239100.2564\r\n' GEODIST distances Munich Paris ft
+check '$11\r\n682477.7582\r\n' GEODIST distances Munich Paris m
+check '$-1\r\n' GEODIST distances Munich nowhere
+check '$-1\r\n' GEODIST missing_key Munich Paris
+check '-ERR unsupported unit provided. please use M, KM, FT, MI\r\n' GEODIST distances Munich Paris yd
+check '-ERR syntax error\r\n' GEODIST distances Munich Paris km extra
+check "$wrongtype" GEODIST a-string a b
+check "-ERR wrong number of arguments for 'geodist' command\\r\\n" GEODIST distances Munich
+
 echo "== arity and syntax"
 check "-ERR wrong number of arguments for 'geoadd' command\\r\\n" GEOADD places 1 2
 check '-ERR syntax error. Try GEOADD key [x1] [y1] [name1] [x2] [y2] [name2] ... \r\n' GEOADD places 1 2 a 3
