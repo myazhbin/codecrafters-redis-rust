@@ -69,6 +69,20 @@ with tempfile.TemporaryDirectory() as tmp:
         command(b"+PONG\r\n", "PING")
     check("it's still there", os.path.isdir(aof_dir))
 
+    print("== stage test: an empty incremental AOF file is created at startup")
+    incr = os.path.join(aof_dir, "appendonly.aof.1.incr.aof")
+    check("the directory had one already, from the stage before", os.path.isfile(incr))
+    os.remove(incr)
+    with running_server(*aof_args):
+        check("it's created again", os.path.isfile(incr))
+        check("and it's empty", os.path.getsize(incr) == 0, f"{os.path.getsize(incr)} bytes")
+
+    print("== the file is named after --appendfilename, in --appenddirname")
+    with running_server("--dir", tmp, "--appendonly", "yes", "--appenddirname", "other",
+                        "--appendfilename", "log.aof"):
+        path = os.path.join(tmp, "other", "log.aof.1.incr.aof")
+        check("other/log.aof.1.incr.aof is created", os.path.isfile(path))
+
     print("== the server exits with a message if it can't create the directory")
     blocker = os.path.join(tmp, "a-file")
     open(blocker, "w").close()
