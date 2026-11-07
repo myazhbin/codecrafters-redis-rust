@@ -533,6 +533,12 @@ async fn serve_client(mut stream: TcpStream, db: &Db, session: &mut Session) -> 
                     stream.write_all(&message).await?;
                 }
             }
+            // A client that isn't logged in can only log in.
+            if session.user.is_none() && !is_command(&request, b"AUTH") {
+                let reply = Value::Error("NOAUTH Authentication required.".into());
+                stream.write_all(&reply.encode()).await?;
+                continue;
+            }
             if let Some(replies) = pubsub_command(&request, db, session) {
                 for reply in replies {
                     stream.write_all(&reply.encode()).await?;
@@ -2197,6 +2203,16 @@ fn replconf_argument<'a>(request: &'a Value, option: &[u8]) -> Option<&'a [u8]> 
             Some(argument)
         }
         _ => None,
+    }
+}
+
+/// Whether `request` is the command called `name`, in any case.
+fn is_command(request: &Value, name: &[u8]) -> bool {
+    match request {
+        Value::Array(items) => {
+            matches!(items.first(), Some(Value::BulkString(first)) if first.eq_ignore_ascii_case(name))
+        }
+        _ => false,
     }
 }
 

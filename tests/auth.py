@@ -9,6 +9,7 @@ MYPASSWORD = "89e01536ac207279409d4de1e5253e01f4a1769e696db0d6062ca9b8f56767c8"
 SECOND = "16367aacb67a4a017c8da8ab95682ccb390863780f7114dda0a0e0c55644c7c4"
 SECRET = "2bb80d537b1da3e38bd30361aa855686bde0eacd7162fef6a25fe97bf527a25b"
 WRONGPASS = b"-WRONGPASS invalid username-password pair or user is disabled.\r\n"
+NOAUTH = b"-NOAUTH Authentication required.\r\n"
 
 
 def getuser(flags, passwords):
@@ -87,5 +88,30 @@ with running_server():
     run(client, OK, "AUTH", "alice", "secret")
     run(client, b"-ERR wrong number of arguments for 'auth' command\r\n", "AUTH")
     run(client, b"-ERR syntax error\r\n", "AUTH", "a", "b", "c")
+
+with running_server():
+    print("== stage test: once the default user has a password, new connections aren't logged in")
+    first = Client()
+    run(first, OK, "ACL", "SETUSER", "default", ">newpassword")
+    run(first, bulk("default"), "ACL", "WHOAMI")
+    second = Client()
+    run(second, NOAUTH, "ACL", "WHOAMI")
+
+    print("== every command but AUTH is refused, while the first client carries on")
+    for args in [("PING",), ("GET", "k"), ("SET", "k", "v"), ("ECHO", "hi"), ("MULTI",),
+                 ("SUBSCRIBE", "news"), ("ACL", "GETUSER", "default"), ("CONFIG", "GET", "dir"),
+                 ("BOGUS",)]:
+        run(second, NOAUTH, *args)
+    run(second, WRONGPASS, "AUTH", "default", "wrong")
+    run(second, NOAUTH, "PING")
+    run(first, OK, "SET", "k", "v")
+    run(first, b"$1\r\nv\r\n", "GET", "k")
+    command(NOAUTH, "GET", "k")
+
+    print("== with nopass again, new connections are logged in again")
+    run(first, OK, "ACL", "SETUSER", "default", "nopass")
+    command(bulk("default"), "ACL", "WHOAMI")
+    command(b"$1\r\nv\r\n", "GET", "k")
+    run(second, NOAUTH, "PING")
 
 finish()
