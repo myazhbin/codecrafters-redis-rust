@@ -80,12 +80,19 @@ pub fn count_in_bits(bytes: &[u8], start: i64, end: i64) -> u64 {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum BitOp {
     And,
+    Or,
+    Xor,
+    /// Takes just one source.
+    Not,
 }
 
 impl BitOp {
     pub fn parse(name: &[u8]) -> Option<Self> {
         match name.to_ascii_uppercase().as_slice() {
             b"AND" => Some(BitOp::And),
+            b"OR" => Some(BitOp::Or),
+            b"XOR" => Some(BitOp::Xor),
+            b"NOT" => Some(BitOp::Not),
             _ => None,
         }
     }
@@ -100,6 +107,9 @@ pub fn combine(op: BitOp, sources: &[&[u8]]) -> Vec<u8> {
             let byte = |source: &&[u8]| source.get(i).copied().unwrap_or(0);
             match op {
                 BitOp::And => sources.iter().map(byte).fold(0xFF, |a, b| a & b),
+                BitOp::Or => sources.iter().map(byte).fold(0, |a, b| a | b),
+                BitOp::Xor => sources.iter().map(byte).fold(0, |a, b| a ^ b),
+                BitOp::Not => !byte(&sources[0]),
             }
         })
         .collect()
@@ -121,6 +131,18 @@ mod tests {
         assert_eq!(combine(BitOp::And, &[&[], &[]]), []);
         assert_eq!(BitOp::parse(b"and"), Some(BitOp::And));
         assert_eq!(BitOp::parse(b"nand"), None);
+    }
+
+    #[test]
+    fn ors_xors_and_nots_bitmaps() {
+        // 10001000 OR 10000010.
+        assert_eq!(combine(BitOp::Or, &[&[0b1000_1000], &[0b1000_0010]]), [0b1000_1010]);
+        let long = [0b0100_0000, 0b0010_0000];
+        assert_eq!(combine(BitOp::Or, &[&long, &[0b0100_0000]]), long);
+        assert_eq!(combine(BitOp::Xor, &[&[0b1100_0000], &[0b1010_0000]]), [0b0110_0000]);
+        assert_eq!(combine(BitOp::Xor, &[&long, &long]), [0, 0]);
+        assert_eq!(combine(BitOp::Not, &[&[0b1100_0000, 0xFF]]), [0b0011_1111, 0]);
+        assert_eq!(BitOp::parse(b"Or"), Some(BitOp::Or));
     }
 
     #[test]

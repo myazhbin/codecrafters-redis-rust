@@ -134,6 +134,30 @@ check '+OK\r\n' SET doomed x
 check ':0\r\n' BITOP AND doomed missing
 check '+none\r\n' TYPE doomed
 
+echo "== stage test: BITOP OR keeps the bits set in any source"
+check ':1\r\n' BITOP OR or-dest key1 key2
+check ':1\r\n' GETBIT or-dest 0
+check ':1\r\n' GETBIT or-dest 4
+check ':1\r\n' GETBIT or-dest 6
+check ':3\r\n' BITCOUNT or-dest
+check ':0\r\n' SETBIT key3 1 1
+check ':0\r\n' SETBIT key3 10 1
+check ':0\r\n' SETBIT key4 1 1
+check ':2\r\n' BITOP OR dest5 key3 key4
+check ':1\r\n' GETBIT dest5 1
+check ':1\r\n' GETBIT dest5 10
+check ':2\r\n' BITCOUNT dest5
+
+echo "== XOR and NOT"
+check ':1\r\n' BITOP XOR xor-dest key1 key2
+check ':0\r\n' GETBIT xor-dest 0
+check ':1\r\n' GETBIT xor-dest 4
+check ':1\r\n' GETBIT xor-dest 6
+check ':1\r\n' BITOP NOT not-dest key1
+check ':6\r\n' BITCOUNT not-dest
+check ':0\r\n' GETBIT not-dest 0
+check '-ERR BITOP NOT must be called with a single source key.\r\n' BITOP NOT not-dest key1 key2
+
 echo "== BITOP errors"
 check '-ERR syntax error\r\n' BITOP NAND dest key1 key2
 check ':1\r\n' RPUSH bitop-list x

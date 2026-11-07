@@ -1754,6 +1754,9 @@ fn bitop(db: &mut Store, op: &[u8], dest: &[u8], sources: &[Vec<u8>]) -> Value {
     let Some(op) = bitmap::BitOp::parse(op) else {
         return Value::Error("ERR syntax error".into());
     };
+    if op == bitmap::BitOp::Not && sources.len() != 1 {
+        return Value::Error("ERR BITOP NOT must be called with a single source key.".into());
+    }
     let mut values = Vec::new();
     for key in sources {
         match live_value(db, key) {
