@@ -62,6 +62,13 @@ check '+OK\r\n' SET a-string v
 check "$wrongtype" GEOPOS a-string London
 check "-ERR wrong number of arguments for 'geopos' command\\r\\n" GEOPOS
 
+echo "== stage test: GEOPOS decodes scores added with ZADD"
+check ':4\r\n' ZADD decoded 3663832614298053 Foo 3876464048901851 Bar 3468915414364476 Baz 3781709020344510 Caz
+check "*1\\r\\n$(array 2.294471561908722 48.85846255040141)" GEOPOS decoded Foo
+check "*1\\r\\n$(array 49.12499874830246 72.99100027813947)" GEOPOS decoded Bar
+check "*1\\r\\n$(array 10.087200701236725 34.50260034107079)" GEOPOS decoded Baz
+check "*1\\r\\n$(array 41.12499922513962 73.99100100464304)" GEOPOS decoded Caz
+
 echo "== arity and syntax"
 check "-ERR wrong number of arguments for 'geoadd' command\\r\\n" GEOADD places 1 2
 check '-ERR syntax error. Try GEOADD key [x1] [y1] [name1] [x2] [y2] [name2] ... \r\n' GEOADD places 1 2 a 3
