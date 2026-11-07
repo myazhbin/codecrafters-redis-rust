@@ -9,6 +9,11 @@ with running_server():
     command(bulk("default"), "ACL", "WHOAMI")
     command(bulk("default"), "acl", "whoami")
 
+    print("== stage test: ACL GETUSER gives the default user's flags")
+    command(b"*2\r\n" + bulk("flags") + b"*0\r\n", "ACL", "GETUSER", "default")
+    command(b"$-1\r\n", "ACL", "GETUSER", "nobody")
+    command(b"-ERR wrong number of arguments for 'acl|getuser' command\r\n", "ACL", "GETUSER")
+
     print("== ACL errors")
     command(b"-ERR wrong number of arguments for 'acl|whoami' command\r\n", "ACL", "WHOAMI", "x")
     command(b"-ERR wrong number of arguments for 'acl' command\r\n", "ACL")

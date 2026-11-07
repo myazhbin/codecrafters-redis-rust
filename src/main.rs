@@ -1327,12 +1327,24 @@ fn run_command(db: &mut Store, command: &[Vec<u8>]) -> Value {
             _ => wrong_arity("unwatch"),
         },
         b"INFO" => info(db, args),
-        b"ACL" => match args.first() {
-            None => wrong_arity("acl"),
-            Some(subcommand) => Value::Error(format!(
-                "ERR unknown subcommand '{}'. Try ACL HELP.",
-                String::from_utf8_lossy(subcommand)
-            )),
+        b"ACL" => match args {
+            [] => wrong_arity("acl"),
+            [subcommand, rest @ ..] => match subcommand.to_ascii_uppercase().as_slice() {
+                b"GETUSER" => match rest {
+                    [name] => match db.users.get(name) {
+                        Some(_) => Value::Array(vec![
+                            Value::BulkString(b"flags".to_vec()),
+                            Value::Array(vec![]),
+                        ]),
+                        None => Value::NullBulkString,
+                    },
+                    _ => wrong_arity("acl|getuser"),
+                },
+                _ => Value::Error(format!(
+                    "ERR unknown subcommand '{}'. Try ACL HELP.",
+                    String::from_utf8_lossy(subcommand)
+                )),
+            },
         },
         b"CONFIG" => config_command(&db.config, args),
         // Nothing uses what a replica says about itself in the handshake. The REPLCONFs that
