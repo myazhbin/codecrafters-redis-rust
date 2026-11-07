@@ -11,7 +11,22 @@ check ':1\r\n' SETBIT bitmap_key 3 1
 check ':1\r\n' SETBIT bitmap_key 3 0
 check ':0\r\n' SETBIT bitmap_key 3 0
 
+echo "== stage test: GETBIT reads a bit back"
+check ':0\r\n' SETBIT bit_key 2 1
+check ':1\r\n' GETBIT bit_key 2
+check ':0\r\n' GETBIT bit_key 3
+check ':0\r\n' GETBIT new_key 2
+
+echo "== bits past the end of the string are 0"
+check ':0\r\n' GETBIT bit_key 8
+check ':0\r\n' GETBIT bit_key 4294967295
+check ':0\r\n' SETBIT bit_key 2 0
+check ':0\r\n' GETBIT bit_key 2
+
 echo "== errors"
+check "$offset_error" GETBIT bit_key -1
+check "$offset_error" GETBIT bit_key 4294967296
+check "-ERR wrong number of arguments for 'getbit' command\\r\\n" GETBIT bit_key
 check "$offset_error" SETBIT bad -1 1
 check "$offset_error" SETBIT bad x 1
 check "$offset_error" SETBIT bad 4294967296 1

@@ -1066,6 +1066,19 @@ fn run_command(db: &mut Store, command: &[Vec<u8>]) -> Value {
             }
             _ => wrong_arity("setbit"),
         },
+        b"GETBIT" => match args {
+            [key, offset] => {
+                let Some(offset) = bitmap::parse_offset(offset) else {
+                    return Value::Error("ERR bit offset is not an integer or out of range".into());
+                };
+                match live_value(db, key) {
+                    Some(Data::String(bytes)) => Value::Integer(i64::from(bitmap::get_bit(bytes, offset))),
+                    Some(_) => wrong_type(),
+                    None => Value::Integer(0),
+                }
+            }
+            _ => wrong_arity("getbit"),
+        },
         b"ZADD" => match args {
             [_, _, _, ..] if args.len() % 2 == 0 => {
                 Value::Error("ERR syntax error".into())
