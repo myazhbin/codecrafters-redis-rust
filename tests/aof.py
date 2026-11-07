@@ -8,8 +8,10 @@ import sys
 import tempfile
 import time
 
-from helpers import (DEFAULT_BINARY, OK, OTHER_PORT, QUEUED, WRONGTYPE, Client, check, command,
-                     encode, finish, run, running_server)
+from helpers import (DEFAULT_BINARY, OK, OTHER_PORT, QUEUED, WRONGTYPE, Client, bulk, check,
+                     command, encode, finish, run, running_server)
+
+NULL = b"$-1\r\n"
 
 BINARY = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_BINARY
 
@@ -41,6 +43,11 @@ def commands_in(data):
 def read(path):
     with open(path, "rb") as f:
         return f.read()
+
+
+def write(path, data):
+    with open(path, "wb") as f:
+        f.write(data)
 
 
 def manifest_naming(aof_dir, appendfilename, incr_name):
@@ -247,6 +254,83 @@ with tempfile.TemporaryDirectory() as tmp:
             run(discarded, reply, *args)
         discarded.close()
         file_is(incr, logged, "none of them is in the AOF")
+
+with tempfile.TemporaryDirectory() as tmp:
+    aof_dir = os.path.join(tmp, "aofdir")
+    incr = manifest_naming(aof_dir, "log.aof", "papaya.1.incr.aof")
+    write(incr, encode("SET", "foo", "bar"))
+    # An RDB file with a key in it, which shouldn't be loaded while the AOF is on.
+    write(os.path.join(tmp, "dump.rdb"),
+          b"REDIS0011\xfe\x00\x00\x08from-rdb\x01x\xff" + b"\x00" * 8)
+    args = ("--dir", tmp, "--dbfilename", "dump.rdb", "--appendonly", "yes",
+            "--appenddirname", "aofdir", "--appendfilename", "log.aof")
+
+    print("== stage test: the SET in the file the manifest names is replayed at startup")
+    with running_server(*args):
+        command(bulk("bar"), "GET", "foo")
+        file_is(incr, encode("SET", "foo", "bar"), "replaying doesn't log the SET again")
+        command(OK, "SET", "baz", "1")
+        file_is(incr, encode("SET", "foo", "bar") + encode("SET", "baz", "1"), "new writes go after it")
+
+        print("== with the AOF on, the RDB file isn't loaded")
+        command(NULL, "GET", "from-rdb")
+
+    print("== so a restart gets back everything written")
+    with running_server(*args):
+        command(bulk("bar"), "GET", "foo")
+        command(bulk("1"), "GET", "baz")
+
+    print("== without the AOF, the RDB file is loaded instead")
+    with running_server("--dir", tmp, "--dbfilename", "dump.rdb"):
+        command(bulk("x"), "GET", "from-rdb")
+        command(NULL, "GET", "foo")
+
+    print("== a file that ends partway through a command is cut off there")
+    write(incr, encode("SET", "a", "1") + encode("SET", "b", "2")[:-3])
+    with running_server(*args):
+        command(bulk("1"), "GET", "a")
+        command(NULL, "GET", "b")
+        file_is(incr, encode("SET", "a", "1"), "the partial command is gone from the file")
+        command(OK, "SET", "c", "3")
+        file_is(incr, encode("SET", "a", "1") + encode("SET", "c", "3"), "and new writes follow on")
+
+    print("== expiries are replayed as the times they were")
+    soon, later = int(time.time() * 1000) + 800, int(time.time() * 1000) + 60000
+    write(incr, encode("SET", "past", "v", "PXAT", "1000") + encode("SET", "soon", "v", "PXAT", str(soon))
+          + encode("SET", "later", "v", "PXAT", str(later)))
+    with running_server(*args):
+        command(NULL, "GET", "past")
+        command(bulk("v"), "GET", "soon")
+        command(bulk("v"), "GET", "later")
+        time.sleep(max(0, (soon + 100) / 1000 - time.time()))
+        command(NULL, "GET", "soon")
+
+    print("== a file as Redis writes it: SELECT, MULTI and EXEC, and an RDB base file")
+    write(os.path.join(aof_dir, "log.aof.manifest"),
+          b"file log.aof.1.base.rdb seq 1 type b\nfile papaya.1.incr.aof seq 1 type i\n")
+    write(os.path.join(aof_dir, "log.aof.1.base.rdb"),
+          b"REDIS0011\xfe\x00\x00\x04base\x01x\x00\x01y\x011\xff" + b"\x00" * 8)
+    write(incr, encode("SELECT", "0") + encode("MULTI") + encode("SET", "m", "1") + encode("INCR", "y")
+          + encode("EXEC") + encode("SET", "base", "replaced"))
+    with running_server(*args):
+        command(bulk("1"), "GET", "m")
+        command(bulk("2"), "GET", "y")
+        command(bulk("replaced"), "GET", "base")
+
+    print("== the server exits with a message if an AOF file isn't RESP")
+    write(incr, b"hello\r\n")
+    result = subprocess.run([BINARY, "--port", str(OTHER_PORT), *args],
+                            capture_output=True, text=True, timeout=5)
+    check("it exits with status 1", result.returncode == 1, f"status {result.returncode}")
+    check("and says why", "isn't valid RESP" in result.stderr, f"stderr: {result.stderr!r}")
+
+    print("== SELECT 0 is all there is")
+    write(incr, b"")
+    with running_server(*args):
+        command(OK, "SELECT", "0")
+        command(b"-ERR DB index is out of range\r\n", "SELECT", "1")
+        command(b"-ERR value is not an integer or out of range\r\n", "SELECT", "x")
+        command(b"-ERR wrong number of arguments for 'select' command\r\n", "SELECT")
 
 with tempfile.TemporaryDirectory() as tmp:
     aof_args = ("--dir", tmp, "--appendonly", "yes", "--appenddirname", "appendonlydir",

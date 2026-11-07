@@ -161,6 +161,20 @@ pub fn incr_file(entries: &[ManifestEntry]) -> Option<&ManifestEntry> {
     entries.iter().rev().find(|entry| entry.kind == FileKind::Incr)
 }
 
+/// The files to replay at startup, in order: the base file, if there is one, then the
+/// incremental files in sequence. History files are left out.
+pub fn replay_order(config: &Config, entries: &[ManifestEntry]) -> Vec<(PathBuf, FileKind)> {
+    let base = entries.iter().find(|entry| entry.kind == FileKind::Base);
+    let mut incrs: Vec<&ManifestEntry> =
+        entries.iter().filter(|entry| entry.kind == FileKind::Incr).collect();
+    incrs.sort_by_key(|entry| entry.seq);
+    let dir = dir(config);
+    base.into_iter()
+        .chain(incrs)
+        .map(|entry| (dir.join(&entry.file), entry.kind))
+        .collect()
+}
+
 /// Parses a manifest: one file per line, given as `key value` pairs separated by spaces
 /// (`file <name> seq <n> type <b|i|h>`, in any order). Blank lines and lines starting
 /// with `#` are skipped, and a name with spaces or other special characters is quoted.
@@ -346,6 +360,35 @@ mod tests {
         );
         assert_eq!(incr_file(&entries), Some(&entries[2]));
         assert_eq!(parse_manifest("").unwrap(), []);
+    }
+
+    #[test]
+    fn replays_the_base_then_the_incremental_files_in_sequence() {
+        let config = Config {
+            dir: "/data".into(),
+            ..Config::default()
+        };
+        let entries = [
+            entry("b.aof", 1, FileKind::Incr),
+            entry("old.aof", 1, FileKind::History),
+            entry("a.aof", 3, FileKind::Incr),
+            entry("base.rdb", 2, FileKind::Base),
+            entry("c.aof", 2, FileKind::Incr),
+        ];
+        let order: Vec<_> = replay_order(&config, &entries)
+            .into_iter()
+            .map(|(path, kind)| (path.display().to_string(), kind))
+            .collect();
+        let dir = "/data/appendonlydir";
+        assert_eq!(
+            order,
+            [
+                (format!("{dir}/base.rdb"), FileKind::Base),
+                (format!("{dir}/b.aof"), FileKind::Incr),
+                (format!("{dir}/c.aof"), FileKind::Incr),
+                (format!("{dir}/a.aof"), FileKind::Incr),
+            ]
+        );
     }
 
     #[test]

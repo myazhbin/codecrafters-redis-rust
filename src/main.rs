@@ -6,7 +6,7 @@ mod glob;
 mod rdb;
 mod resp;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use bytes::{Buf, BytesMut};
 use config::Config;
 use resp::Value;
@@ -218,17 +218,15 @@ async fn main() {
     }));
     // The data and the AOF's files are ready before the server starts listening, so that a
     // client can't get in first.
+    // With the AOF on, the data comes from it rather than from the RDB file, as in Redis.
     if config.appendonly {
-        let opened = aof::set_up(&config).and_then(|files| aof::Aof::open(&config, &files));
-        match opened {
-            Ok(aof) => db.lock().unwrap().aof = Some(aof),
-            Err(e) => {
-                eprintln!("{e:#}");
-                std::process::exit(1);
-            }
+        if let Err(e) = start_aof(&mut db.lock().unwrap(), &config) {
+            eprintln!("{e:#}");
+            std::process::exit(1);
         }
+    } else {
+        load_rdb_file(&mut db.lock().unwrap(), &config);
     }
-    load_rdb_file(&mut db.lock().unwrap(), &config);
     let listener = TcpListener::bind(("127.0.0.1", config.port)).await.unwrap();
 
     if let Some((host, master_port)) = config.replicaof {
@@ -289,6 +287,61 @@ async fn connect_to_master(host: &str, port: u16, listening_port: u16, db: &Db) 
         db.repl_offset = offset;
     }
     follow_master(&mut master, &mut buf, db).await
+}
+
+/// Gets the AOF going at startup: sets up its files, replays them to get the data back,
+/// and then opens the incremental file for writes to be appended to.
+fn start_aof(db: &mut Store, config: &Config) -> Result<()> {
+    let files = aof::set_up(config)?;
+    for (path, kind) in aof::replay_order(config, &files) {
+        let data = std::fs::read(&path)
+            .with_context(|| format!("couldn't read the append-only file {}", path.display()))?;
+        // A base file can be an RDB file rather than a list of commands.
+        if kind == aof::FileKind::Base && data.starts_with(b"REDIS") {
+            load_rdb(db, &data);
+        } else {
+            replay_commands(db, &path, &data)?;
+        }
+    }
+    // Nobody can be waiting yet for the lists the replay pushed to.
+    db.pushed.clear();
+    db.aof = Some(aof::Aof::open(config, &files)?);
+    Ok(())
+}
+
+/// Runs the commands in an AOF file, one after another, as a client sending them would.
+/// If the file ends partway through a command, as a crash while writing can leave it,
+/// that part is cut off the file, as Redis does.
+fn replay_commands(db: &mut Store, path: &std::path::Path, data: &[u8]) -> Result<()> {
+    let mut pos = 0;
+    while pos < data.len() {
+        let parsed = Value::parse(&data[pos..]).with_context(|| {
+            format!("the append-only file {} isn't valid RESP at byte {pos}", path.display())
+        })?;
+        let Some((request, len)) = parsed else {
+            eprintln!(
+                "the append-only file {} ends partway through a command; cutting off its last {} bytes",
+                path.display(),
+                data.len() - pos
+            );
+            let file = std::fs::OpenOptions::new().write(true).open(path)?;
+            file.set_len(pos as u64)?;
+            break;
+        };
+        pos += len;
+        let Some(command) = command_args(request) else {
+            bail!("the append-only file {} holds something that isn't a command", path.display());
+        };
+        // Redis wraps transactions in MULTI and EXEC; their commands are all that matter.
+        let name = command.first().map(|name| name.to_ascii_uppercase());
+        if matches!(name.as_deref(), Some(b"MULTI" | b"EXEC")) {
+            continue;
+        }
+        if let Value::Error(msg) = run_command(db, &command) {
+            eprintln!("replaying the append-only file: {msg}");
+        }
+    }
+    Ok(())
 }
 
 /// Loads the keys from the RDB file that `--dir` and `--dbfilename` name, if it exists.
@@ -772,6 +825,15 @@ fn run_command(db: &mut Store, command: &[Vec<u8>]) -> Value {
         b"INCR" => match args {
             [key] => increment(db, key),
             _ => wrong_arity("incr"),
+        },
+        // There's only one database, number 0, but replayed AOF files select it.
+        b"SELECT" => match args {
+            [index] if parse_number::<i64>(index) == Some(0) => Value::SimpleString("OK".into()),
+            [index] if parse_number::<i64>(index).is_some() => {
+                Value::Error("ERR DB index is out of range".into())
+            }
+            [_] => Value::Error("ERR value is not an integer or out of range".into()),
+            _ => wrong_arity("select"),
         },
         b"KEYS" => match args {
             [pattern] => matching_keys(db, pattern),
