@@ -90,6 +90,31 @@ check '-ERR syntax error\r\n' GEODIST distances Munich Paris km extra
 check "$wrongtype" GEODIST a-string a b
 check "-ERR wrong number of arguments for 'geodist' command\\r\\n" GEODIST distances Munich
 
+echo "== stage test: GEOSEARCH finds the locations within a radius"
+check ':3\r\n' GEOADD searched 11.5030378 48.164271 Munich 2.2944692 48.8584625 Paris -0.0884948 51.506479 London
+check "$(array Paris)" GEOSEARCH searched FROMLONLAT 2 48 BYRADIUS 100000 m
+check "$(array London Paris)" GEOSEARCH searched FROMLONLAT 2 48 BYRADIUS 500000 m
+check "$(array Munich)" GEOSEARCH searched FROMLONLAT 11 50 BYRADIUS 300000 m
+
+echo "== units, the edge of the circle, and nothing found"
+check "$(array Paris)" GEOSEARCH searched FROMLONLAT 2 48 BYRADIUS 100 km
+check "$(array London Paris Munich)" GEOSEARCH searched fromlonlat 2 48 byradius 500 MI
+check "$(array Paris)" GEOSEARCH searched FROMLONLAT 2 48 BYRADIUS 97926 m
+check '*0\r\n' GEOSEARCH searched FROMLONLAT 2 48 BYRADIUS 97925 m
+check '*0\r\n' GEOSEARCH searched FROMLONLAT 2 48 BYRADIUS 0 m
+check '*0\r\n' GEOSEARCH missing_key FROMLONLAT 2 48 BYRADIUS 100 km
+check "$(array Paris)" GEOSEARCH searched BYRADIUS 100 km FROMLONLAT 2 48
+
+echo "== GEOSEARCH errors"
+check '-ERR unsupported unit provided. please use M, KM, FT, MI\r\n' GEOSEARCH searched FROMLONLAT 2 48 BYRADIUS 100 yd
+check '-ERR radius cannot be negative\r\n' GEOSEARCH searched FROMLONLAT 2 48 BYRADIUS -1 m
+check '-ERR invalid longitude,latitude pair 200.000000,48.000000\r\n' GEOSEARCH searched FROMLONLAT 200 48 BYRADIUS 1 m
+check '-ERR exactly one of BYRADIUS and BYBOX can be specified for GEOSEARCH\r\n' GEOSEARCH searched FROMLONLAT 2 48 FROMLONLAT 2 48
+check '-ERR exactly one of FROMMEMBER or FROMLONLAT can be specified for GEOSEARCH\r\n' GEOSEARCH searched BYRADIUS 1 m BYRADIUS 1 m
+check '-ERR syntax error\r\n' GEOSEARCH searched FROMLONLAT 2 48 BYRADIUS 1 m WITHDIST
+check "$wrongtype" GEOSEARCH a-string FROMLONLAT 2 48 BYRADIUS 1 m
+check "-ERR wrong number of arguments for 'geosearch' command\\r\\n" GEOSEARCH searched FROMLONLAT 2 48 BYRADIUS
+
 echo "== arity and syntax"
 check "-ERR wrong number of arguments for 'geoadd' command\\r\\n" GEOADD places 1 2
 check '-ERR syntax error. Try GEOADD key [x1] [y1] [name1] [x2] [y2] [name2] ... \r\n' GEOADD places 1 2 a 3

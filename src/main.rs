@@ -1158,6 +1158,10 @@ fn run_command(db: &mut Store, command: &[Vec<u8>]) -> Value {
             [_, _, _, ..] => Value::Error("ERR syntax error".into()),
             _ => wrong_arity("geodist"),
         },
+        b"GEOSEARCH" => match args {
+            [key, options @ ..] if options.len() >= 5 => geosearch(db, key, options),
+            _ => wrong_arity("geosearch"),
+        },
         b"GEOPOS" => match args {
             [key, members @ ..] => {
                 let set = match live_value(db, key) {
@@ -1893,6 +1897,66 @@ fn geoadd(db: &mut Store, key: &[u8], locations: &[Vec<u8>]) -> Value {
         members.push((geo::encode(longitude, latitude) as f64, &location[2]));
     }
     add_to_sorted_set(db, key, members)
+}
+
+/// GEOSEARCH, with the center given by `FROMLONLAT <longitude> <latitude>` and the area by
+/// `BYRADIUS <radius> <unit>`, the only options supported: the members of the sorted set
+/// at `key` whose locations are within the circle, in the set's order.
+fn geosearch(db: &mut Store, key: &[u8], options: &[Vec<u8>]) -> Value {
+    let (mut center, mut radius) = (None, None);
+    let mut rest = options;
+    while let [option, ..] = rest {
+        match (option.to_ascii_uppercase().as_slice(), rest) {
+            (b"FROMLONLAT", [_, longitude, latitude, after @ ..]) => {
+                let (Some(longitude), Some(latitude)) =
+                    (parse_number::<f64>(longitude), parse_number::<f64>(latitude))
+                else {
+                    return Value::Error("ERR value is not a valid float".into());
+                };
+                if !geo::is_valid(longitude, latitude) {
+                    return Value::Error(format!(
+                        "ERR invalid longitude,latitude pair {longitude:.6},{latitude:.6}"
+                    ));
+                }
+                center = Some((longitude, latitude));
+                rest = after;
+            }
+            (b"BYRADIUS", [_, distance, unit, after @ ..]) => {
+                let Some(distance) = parse_number::<f64>(distance) else {
+                    return Value::Error("ERR need numeric radius".into());
+                };
+                if distance < 0.0 {
+                    return Value::Error("ERR radius cannot be negative".into());
+                }
+                let Some(to_meters) = geo::unit_in_meters(unit) else {
+                    return unsupported_unit();
+                };
+                radius = Some(distance * to_meters);
+                rest = after;
+            }
+            _ => return Value::Error("ERR syntax error".into()),
+        }
+    }
+    let Some(center) = center else {
+        return Value::Error(
+            "ERR exactly one of FROMMEMBER or FROMLONLAT can be specified for GEOSEARCH".into(),
+        );
+    };
+    let Some(radius) = radius else {
+        return Value::Error(
+            "ERR exactly one of BYRADIUS and BYBOX can be specified for GEOSEARCH".into(),
+        );
+    };
+    let set = match live_value(db, key) {
+        Some(Data::SortedSet(set)) => set,
+        Some(_) => return wrong_type(),
+        None => return Value::Array(vec![]),
+    };
+    let found = set
+        .iter()
+        .filter(|(score, _)| geo::distance(center, geo::decode(*score as u64)) <= radius)
+        .map(|(_, member)| Value::BulkString(member.to_vec()));
+    Value::Array(found.collect())
 }
 
 fn unsupported_unit() -> Value {
