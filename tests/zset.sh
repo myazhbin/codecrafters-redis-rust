@@ -66,6 +66,26 @@ check '*0\r\n' ZRANGE listed 5 10
 check '*0\r\n' ZRANGE listed 3 1
 check '*0\r\n' ZRANGE missing 0 10
 
+echo "== stage test: negative indexes count back from the end"
+check ':1\r\n' ZADD negative 20.0 foo
+check ':1\r\n' ZADD negative 30.1 bar
+check ':1\r\n' ZADD negative 40.2 baz
+check ':1\r\n' ZADD negative 25.0 paz
+check ':1\r\n' ZADD negative 25.0 caz
+check "$(array paz bar baz)" ZRANGE negative 2 -1
+check "$(array foo caz paz bar baz)" ZRANGE negative 0 -1
+check "$(array bar baz)" ZRANGE negative -2 -1
+check "$(array foo caz paz)" ZRANGE negative 0 -3
+check "$(array foo caz)" ZRANGE negative -100 1
+check "$(array foo caz paz bar baz)" ZRANGE negative -5 -1
+check '*0\r\n' ZRANGE negative -1 -2
+check '*0\r\n' ZRANGE negative -100 -6
+
+echo "== the stage description's example"
+check ':5\r\n' ZADD racer_scores 8.5 Sam-Bodden 10.2 Royce 6.1 Ford 14.9 Prickett 10.2 Ben
+check "$(array Royce Prickett)" ZRANGE racer_scores -2 -1
+check "$(array Ford Sam-Bodden Ben)" ZRANGE racer_scores 0 -3
+
 echo "== ZRANGE WITHSCORES, errors"
 check "$(array baz 20 caz 30.1)" ZRANGE listed 0 1 WITHSCORES
 check "$(array paz 40.2)" ZRANGE listed 2 2 withscores
