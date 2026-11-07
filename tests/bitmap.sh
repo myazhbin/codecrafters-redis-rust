@@ -92,6 +92,41 @@ check ':1\r\n' RPUSH count-list x
 check "$wrongtype" BITCOUNT count-list
 check "-ERR wrong number of arguments for 'bitcount' command\\r\\n" BITCOUNT
 
+echo "== stage test: BITOP AND keeps the bits set in every source"
+check ':0\r\n' SETBIT key1 0 1
+check ':0\r\n' SETBIT key1 4 1
+check ':0\r\n' SETBIT key2 0 1
+check ':0\r\n' SETBIT key2 6 1
+check ':1\r\n' BITOP AND dest key1 key2
+check ':1\r\n' GETBIT dest 0
+check ':0\r\n' GETBIT dest 4
+check ':0\r\n' GETBIT dest 6
+check ':1\r\n' BITCOUNT dest
+
+echo "== the result replaces what was at the destination, expiry and all"
+check '+OK\r\n' SET old-dest something PX 200
+check ':1\r\n' BITOP and old-dest key1 key2
+sleep 0.3
+check ':1\r\n' GETBIT old-dest 0
+check ':1\r\n' RPUSH list-dest x
+check ':1\r\n' BITOP AND list-dest key1
+check '+string\r\n' TYPE list-dest
+
+echo "== missing sources, and an empty result deleting the destination"
+check ':1\r\n' BITOP AND with-missing key1 missing
+check ':0\r\n' BITCOUNT with-missing
+check ':0\r\n' BITOP AND nothing missing also-missing
+check '+none\r\n' TYPE nothing
+check '+OK\r\n' SET doomed x
+check ':0\r\n' BITOP AND doomed missing
+check '+none\r\n' TYPE doomed
+
+echo "== BITOP errors"
+check '-ERR syntax error\r\n' BITOP NAND dest key1 key2
+check ':1\r\n' RPUSH bitop-list x
+check "$wrongtype" BITOP AND dest key1 bitop-list
+check "-ERR wrong number of arguments for 'bitop' command\\r\\n" BITOP AND dest
+
 echo "== SETBIT changes a string set with SET, keeping its expiry"
 check '+OK\r\n' SET ttl A PX 300
 check ':0\r\n' SETBIT ttl 6 1

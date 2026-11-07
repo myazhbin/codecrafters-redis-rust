@@ -884,7 +884,7 @@ fn propagate_write(db: &mut Store, command: &[Vec<u8>], reply: &Value) {
         (b"SET" | b"RPUSH" | b"LPUSH" | b"INCR", _) => db.propagate(command),
         (b"LPOP", Value::BulkString(_)) => db.propagate(command),
         (b"DEL", Value::Integer(removed)) if *removed > 0 => db.propagate(command),
-        (b"ZADD" | b"SETBIT", Value::Integer(_)) => db.propagate(command),
+        (b"ZADD" | b"SETBIT" | b"BITOP", Value::Integer(_)) => db.propagate(command),
         (b"ZREM", Value::Integer(removed)) if *removed > 0 => db.propagate(command),
         (b"LPOP", Value::Array(popped)) if !popped.is_empty() => db.propagate(command),
         // With the ID spelled out, because a replica would generate a different one.
@@ -1105,6 +1105,10 @@ fn run_command(db: &mut Store, command: &[Vec<u8>]) -> Value {
             }
             [_, ..] => Value::Error("ERR syntax error".into()),
             _ => wrong_arity("bitcount"),
+        },
+        b"BITOP" => match args {
+            [op, dest, sources @ ..] if !sources.is_empty() => bitop(db, op, dest, sources),
+            _ => wrong_arity("bitop"),
         },
         b"GETBIT" => match args {
             [key, offset] => {
@@ -1741,6 +1745,40 @@ fn entries_after(db: &mut Store, keys: &[Vec<u8>], afters: &[StreamId]) -> Optio
     } else {
         Some(Value::Array(streams))
     }
+}
+
+/// BITOP: combines the strings at `sources` with the operation `op`, stores the result at
+/// `dest`, and replies with its length. A missing source counts as an empty string, and an
+/// empty result deletes `dest`.
+fn bitop(db: &mut Store, op: &[u8], dest: &[u8], sources: &[Vec<u8>]) -> Value {
+    let Some(op) = bitmap::BitOp::parse(op) else {
+        return Value::Error("ERR syntax error".into());
+    };
+    let mut values = Vec::new();
+    for key in sources {
+        match live_value(db, key) {
+            Some(Data::String(bytes)) => values.push(bytes.clone()),
+            Some(_) => return wrong_type(),
+            None => values.push(Vec::new()),
+        }
+    }
+    let values: Vec<&[u8]> = values.iter().map(Vec::as_slice).collect();
+    let result = bitmap::combine(op, &values);
+    let len = result.len();
+    if result.is_empty() {
+        if db.entries.remove(dest).is_some() {
+            db.touch(dest);
+        }
+    } else {
+        // The result replaces whatever was at `dest`, along with any expiry.
+        let entry = Entry {
+            value: Data::String(result),
+            expires_at: None,
+        };
+        db.entries.insert(dest.to_vec(), entry);
+        db.touch(dest);
+    }
+    Value::Integer(len as i64)
 }
 
 /// ZADD: adds each member with the score before it, or gives a member that's already

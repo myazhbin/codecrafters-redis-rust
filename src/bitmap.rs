@@ -76,9 +76,52 @@ pub fn count_in_bits(bytes: &[u8], start: i64, end: i64) -> u64 {
     count
 }
 
+/// BITOP's operations.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum BitOp {
+    And,
+}
+
+impl BitOp {
+    pub fn parse(name: &[u8]) -> Option<Self> {
+        match name.to_ascii_uppercase().as_slice() {
+            b"AND" => Some(BitOp::And),
+            _ => None,
+        }
+    }
+}
+
+/// Combines `sources` byte by byte with `op`. Shorter sources count as padded with zero
+/// bytes, so the result is as long as the longest.
+pub fn combine(op: BitOp, sources: &[&[u8]]) -> Vec<u8> {
+    let len = sources.iter().map(|source| source.len()).max().unwrap_or(0);
+    (0..len)
+        .map(|i| {
+            let byte = |source: &&[u8]| source.get(i).copied().unwrap_or(0);
+            match op {
+                BitOp::And => sources.iter().map(byte).fold(0xFF, |a, b| a & b),
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ands_bitmaps() {
+        // 10001000 AND 10000010.
+        assert_eq!(combine(BitOp::And, &[&[0b1000_1000], &[0b1000_0010]]), [0b1000_0000]);
+        // A shorter source counts as padded with zeros.
+        let long = [0b0100_0000, 0b0010_0000];
+        assert_eq!(combine(BitOp::And, &[&long, &[0b0100_0000]]), [0b0100_0000, 0]);
+        assert_eq!(combine(BitOp::And, &[&long, &[]]), [0, 0]);
+        assert_eq!(combine(BitOp::And, &[&long]), long);
+        assert_eq!(combine(BitOp::And, &[&[], &[]]), []);
+        assert_eq!(BitOp::parse(b"and"), Some(BitOp::And));
+        assert_eq!(BitOp::parse(b"nand"), None);
+    }
 
     #[test]
     fn counts_bits_in_byte_ranges() {
